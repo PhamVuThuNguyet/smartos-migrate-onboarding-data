@@ -477,6 +477,8 @@ def _ask(cases: list[dict]) -> list[dict]:
                 "cycle value là {\"months\":number} hoặc {\"full\":true}. "
                 "rooms value là [\"tên phòng\"] khi chỉ một nhãn chưa tách, "
                 "hoặc [{\"label\":\"nhãn gốc\",\"names\":[\"tên phòng\"]}] khi có nhiều nhãn. "
+                "Nhãn có nhiều tên cách nhau bởi dấu phẩy, chấm phẩy hoặc gạch chéo thì tách thành từng tên, "
+                "giữ nguyên chữ của từng tên. Một cụm mô tả không có dấu tách thì để một phần tử. "
                 "currency value là \"VND\" hoặc \"USD\". "
                 "fee value là số tiền tháng của một excelRow, hoặc [{\"excelRow\":number,\"amount\":number}]. "
                 "Trả về một JSON object, không markdown. "

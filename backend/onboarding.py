@@ -257,7 +257,8 @@ def expand_room_names(label: str) -> list[str]:
 
     T501 -> T506 becomes T501..T506. 1A+B becomes 1A and 1B.
     T221-224 + Hlang becomes T221..T224 and Hành lang.
-    A descriptive name such as a lobby stays one zone.
+    Names separated by a comma, semicolon, or slash become separate places.
+    One descriptive name with no separator stays one zone.
     """
 
     def room_code(value: str) -> bool:
@@ -331,15 +332,9 @@ def expand_room_names(label: str) -> list[str]:
     if len(parts) == 1:
         return expand_plus(parts[0])
     expanded: list[str] = []
-    recognized = 0
     for part in parts:
-        names = expand_plus(part)
-        if names != [part] or room_code(part):
-            recognized += 1
-        expanded.extend(names)
-    if recognized == len(parts):
-        return expanded
-    return [label]
+        expanded.extend(expand_plus(part))
+    return expanded or [label]
 
 
 def space_from_row(row) -> dict:
