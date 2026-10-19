@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Migrate onboarding Excel vào SmartOS</title>
+    <style>
+        :root {
+            --ink: #1c1917;
+            --muted: #57534e;
+            --line: #e7e5e4;
+            --paper: #f7f5f1;
+            --card: #fff;
+            --accent: #9a3412;
+            --ok: #166534;
+            --warn: #92400e;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            background: #292524;
+            color: var(--ink);
+            font-family: "Segoe UI", sans-serif;
+        }
+
+        .deck {
+            height: 100%;
+        }
+
+        .slide {
+            display: none;
+            height: 100%;
+            padding: 48px 64px 72px;
+            background: var(--paper);
+        }
+
+        .slide.active {
+            display: flex;
+            flex-direction: column;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 42px;
+            letter-spacing: -0.03em;
+        }
+
+        h2 {
+            margin: 0 0 18px;
+            font-size: 32px;
+            letter-spacing: -0.03em;
+        }
+
+        .lead {
+            margin: 0;
+            max-width: 760px;
+            color: var(--muted);
+            font-size: 20px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--card);
+            font-size: 16px;
+        }
+
+        th,
+        td {
+            border-bottom: 1px solid var(--line);
+            padding: 10px 12px;
+            text-align: left;
+            vertical-align: top;
+        }
+
+        th {
+            background: #fff;
+            font-size: 13px;
+            color: var(--muted);
+        }
+
+        code {
+            font-family: Consolas, monospace;
+            font-size: 0.92em;
+        }
+
+        .flow {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        .node {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 14px 16px;
+            min-width: 140px;
+        }
+
+        .node strong {
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .node span {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .node.accent {
+            border-color: #fdba74;
+            background: #fff7ed;
+        }
+
+        .arrow {
+            color: var(--accent);
+            font-size: 22px;
+        }
+
+        .cols {
+            display: grid;
+            grid-template-columns: 1.1fr 0.9fr;
+            gap: 28px;
+            align-items: start;
+        }
+
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+
+        .step {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 14px 16px;
+        }
+
+        .step b {
+            display: block;
+            color: var(--accent);
+            font-size: 13px;
+            margin-bottom: 6px;
+        }
+
+        .nav {
+            position: fixed;
+            right: 24px;
+            bottom: 18px;
+            color: #d6d3d1;
+            font-size: 14px;
+        }
+
+        .rules table,
+        .api-flow table {
+            font-size: 14px;
+        }
+
+        .rules th,
+        .rules td,
+        .api-flow th,
+        .api-flow td {
+            padding: 7px 10px;
+        }
+
+        .rules h1,
+        .api-flow h1 {
+            margin-bottom: 12px;
+        }
+
+        .arch {
+            justify-content: center;
+            padding-top: 56px;
+            padding-bottom: 56px;
+        }
+
+        .arch h1 {
+            margin-bottom: 28px;
+        }
+
+        .pipeline {
+            display: grid;
+            grid-template-columns: 1fr 28px 1fr 28px 1fr 28px 1fr;
+            align-items: stretch;
+            gap: 0;
+            margin-top: 12px;
+        }
+
+        .arch-card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 22px 20px 20px;
+            min-height: 168px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .arch-card .index {
+            color: var(--accent);
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+        }
+
+        .arch-card strong {
+            display: block;
+            margin: 10px 0 8px;
+            font-size: 22px;
+            letter-spacing: -0.02em;
+        }
+
+        .arch-card p {
+            margin: 0;
+            color: var(--muted);
+            font-size: 15px;
+            line-height: 1.45;
+        }
+
+        .arch-card.accent {
+            background: #fff7ed;
+            border-color: #fdba74;
+        }
+
+        .chevron {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--accent);
+            font-size: 22px;
+        }
+
+        .hint {
+            margin-top: auto;
+            color: var(--muted);
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="deck">
+        <section class="slide arch active">
+            <h1>Kiến trúc</h1>
+            <div class="pipeline">
+                <div class="arch-card">
+                    <span class="index">01</span>
+                    <strong>Excel</strong>
+                    <p>File cùng kiểu cột: STT, khách, tòa, phòng, đơn giá.</p>
+                </div>
+                <div class="chevron">→</div>
+                <div class="arch-card">
+                    <span class="index">02</span>
+                    <strong>Parser</strong>
+                    <p>Dùng defined rules (các cách viết đã gặp) và dựng records trong Excel thành các objects (booking,
+                        room, customer, etc.).</p>
+                </div>
+                <div class="chevron">→</div>
+                <div class="arch-card accent">
+                    <span class="index">03</span>
+                    <strong>Nova 2 Lite</strong>
+                    <p>Nhận input từ parser và chỉnh sửa thêm nếu cần.</p>
+                </div>
+                <div class="chevron">→</div>
+                <div class="arch-card">
+                    <span class="index">04</span>
+                    <strong>API payload</strong>
+                    <p>Gửi API với payload đã được dựng sẵn.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="slide api-flow">
+            <h1>Thứ tự gọi API</h1>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Step</th>
+                        <th>API</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>1</td>
+                        <td><code>createServiceCategory</code><br><code>property.servicecategories</code></td>
+                        <td>Service bắt buộc phải thuộc một category. Excel không có cột category, nên tool tạo một
+                            category với tên “Cho thuê mặt bằng”. Nếu lúc gọi API có truyền category id thì dùng id đó
+                            thay vì tạo mới.</td>
+                    </tr>
+                    <tr>
+                        <td>2</td>
+                        <td><code>createLocation</code><br><code>property.locations</code></td>
+                        <td>Mỗi giá trị unique trong cột “Tòa nhà” là một location. Lúc tạo, <code>serviceIds</code> để
+                            trống vì service chưa tồn tại. Khi gọi API, payload cần <code>representativeId</code>.
+                            Location nào chưa có address thì dùng chính tên tòa làm address tạm.</td>
+                    </tr>
+                    <tr>
+                        <td>3</td>
+                        <td><code>createService</code><br><code>property.services</code></td>
+                        <td>Mỗi giá trị unique trong cột “Dịch vụ cung cấp” là một service. Service gắn
+                            <code>categoryId</code> của bước 1 và <code>locationIds</code> của những location có dịch vụ
+                            đó. API tự thêm service này vào location.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>4</td>
+                        <td><code>createFloor</code><br><code>property.floors</code></td>
+                        <td>Mỗi cặp unique gồm location và giá trị cột “Tầng” là một floor. Floor trỏ tới
+                            <code>locationId</code> vừa tạo, để room ở bước sau gắn vào đúng floor.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>5</td>
+                        <td><code>createRoom</code><br><code>property.rooms</code>, <code>property.packages</code></td>
+                        <td>Mỗi room sau khi tách dải được gửi bằng một lệnh <code>createRoom</code>, kèm package có
+                            <code>unit = months</code> của service tương ứng. Cùng command này tạo cả room và package.
+                            Nếu room đã tồn tại và cần thêm service khác, tool gọi <code>mutatePackages</code> và giữ
+                            package cũ.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>6</td>
+                        <td><code>createExtraServiceType</code><br><code>reservation.extraservicetypes</code></td>
+                        <td>Chỉ gọi khi cột “Đơn giá phí dịch vụ mặc định/tháng” có số lớn hơn 0. Mỗi location có một
+                            extra service type tên “Phí dịch vụ”, catalog price bằng 0. Ô ghi “Không thu phí dịch vụ”
+                            hoặc để trống thì không tạo type. Khi ghi thật, payload cần <code>unitId</code> và
+                            <code>extraServiceCategoryId</code> đã có sẵn.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>7</td>
+                        <td><code>createCompany</code> hoặc
+                            <code>createIndividual</code><br><code>customer.customers</code>
+                        </td>
+                        <td>Bước này đứng sau location vì payload có <code>locationId</code>. Nếu dòng có
+                            <code>taxCode</code>, hoặc tên trong cột “Tên khách hàng” là company, tool gọi
+                            <code>createCompany</code>. Tên individual thì gọi <code>createIndividual</code>. Email đầu
+                            trong cột “Email” là email chính. Các email phía sau, cách nhau bởi dấu chấm phẩy, gạch chéo
+                            hoặc phẩy, được gửi như member.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>8</td>
+                        <td><code>createBooking</code><br><code>reservation.bookings</code>,
+                            <code>reservation.paymentperiods</code>
+                        </td>
+                        <td>Mỗi hợp đồng unique trong Excel là một booking. Payload cần room, package, customer và
+                            location đã tạo ở các bước trước. API tự sinh các payment period. Nếu <code>deposit</code>
+                            lớn hơn 0, booking gửi kèm <code>requiredAmount</code>. Nếu hợp đồng có phí dịch vụ, ngay
+                            sau đó tool gọi <code>updateBookingRoomServices</code>: <code>price</code> là tổng fee của
+                            các room trong hợp đồng, <code>type</code> là <code>EXTRA_SERVICE</code>,
+                            <code>quantity</code> là 1.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>9</td>
+                        <td><code>createInvoices</code>, transaction,
+                            <code>completeBooking</code><br><code>payment.invoices</code>,
+                            <code>payment.transactions</code>
+                        </td>
+                        <td>Kỳ được tính từ ngày bắt đầu hợp đồng theo cột “Kỳ thanh toán”: hàng tháng là từng tháng,
+                            3 tháng, 6 tháng hoặc hàng năm là từng cụm tương ứng. Chỉ kỳ có ngày kết thúc trước ngày
+                            chạy file mới gọi <code>createInvoices</code>. <code>issueDate</code> và
+                            <code>transactionDate</code> là ngày bắt đầu của kỳ đó. Payment method là Transfer
+                            (<code>bank</code>).
+                            <code>completeBooking</code> chỉ chạy khi <code>endTime</code> của booking sớm hơn ngày chạy
+                            file. Nếu cột “Mẫu hợp đồng” có tên, tool tìm <code>contractTemplateId</code> theo tên đó
+                            rồi gọi <code>createContract</code> với số hợp đồng và template id.
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="slide rules">
+            <h1>Rules đọc dữ liệu</h1>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Tình huống</th>
+                        <th>Cách đưa vào API</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>Sheet</td>
+                        <td>Tool không gắn cứng tên sheet. Nó tìm sheet có hàng tiêu đề chứa STT, “Tên khách hàng”, “Tòa
+                            nhà”, “Khu vực/phòng” và “Đơn giá cho thuê/tháng”, rồi lấy các dòng bên dưới hàng đó làm dữ
+                            liệu.</td>
+                    </tr>
+                    <tr>
+                        <td>Room</td>
+                        <td>Trước khi gọi <code>createRoom</code>, parser tách dải phòng và mã ghép trong cột “Khu
+                            vực/phòng”. <code>T501 -&gt; T506</code> thành sáu room T501 đến T506. <code>1A+B</code>
+                            thành room 1A và room 1B. <code>T221-224 + Hlang</code> thành room T221 đến T224 và zone
+                            Hành lang. Danh sách cách nhau bởi dấu phẩy cũng được tách thành từng mã. <code>area</code>,
+                            rent và fee của cả dải được chia đều cho từng room. Tên mô tả như sảnh được giữ là một zone,
+                            không tách thêm.</td>
+                    </tr>
+                    <tr>
+                        <td>Amount</td>
+                        <td>Nếu ô “Đơn giá cho thuê/tháng” là công thức nhân với cột “Diện tích (m2)”, package dùng
+                            <code>priceType = per-square-meter</code> và <code>amount</code> là đơn giá mỗi m2. Nếu ô đó
+                            là số đã tính xong, <code>priceType = per-room</code> và <code>amount</code> là tổng tiền
+                            tháng. Dòng không có rent, hoặc ghi <code>ACC</code>, không tạo room và không đưa zone đó
+                            vào booking.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>Zone</td>
+                        <td>Khi giá trị cột “Diện tích (m2)” không phải số, <code>createRoom</code> gửi
+                            <code>isZone = true</code>. Room có <code>area</code> là số thì là room thường và gửi
+                            <code>tier = standard</code>. Rule này không dựa vào các chữ “quảng cáo”, “ATM” hay “kiot”
+                            trong tên.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>Customer</td>
+                        <td>Nếu cột “Thông tin DN thuê (MST)” có giá trị, tool gọi <code>createCompany</code> và xóa
+                            khoảng trắng trong <code>taxCode</code> trước khi gửi. Nếu không có <code>taxCode</code>
+                            nhưng cột “Tên khách hàng” là company, tool vẫn gọi <code>createCompany</code>. Tên
+                            individual thì gọi <code>createIndividual</code>. Email đầu trong cột “Email” là email
+                            chính. Các email phía sau, cách nhau bởi dấu chấm phẩy, gạch chéo hoặc phẩy, được gửi như
+                            member.</td>
+                    </tr>
+                    <tr>
+                        <td>Booking</td>
+                        <td>Dòng có STT mở một booking mới. Dòng không có STT được nối vào booking phía trên. Nếu dòng
+                            nối có số hợp đồng, service hoặc <code>startTime</code> khác booking hiện tại, tool tách
+                            thành booking khác. Khóa để không tạo trùng là location, service, <code>startTime</code> và
+                            số hợp đồng.</td>
+                    </tr>
+                    <tr>
+                        <td>Deposit và payment period</td>
+                        <td>Nếu cột cọc ghi số tiền, <code>createBooking</code> nhận số đó làm
+                            <code>requiredAmount</code>. Nếu ghi số tháng, tool nhân số tháng với rent của tháng. Câu có
+                            chữ “không” thì deposit bằng 0. Cột “Kỳ thanh toán” ghi hàng tháng thì duration là 1, quý là
+                            3, năm là 12. Câu thanh toán toàn bộ thành một payment period từ <code>startTime</code> đến
+                            <code>endTime</code>.
+                        </td>
+                    </tr>
+                    <tr>
+                        <td>Nova</td>
+                        <td>Nova nhận từng hợp đồng còn field parser chưa chốt, kèm cả dòng đã đọc và
+                            <code>parserResult</code>. Hợp đồng parser đã chốt thì không gọi Nova. Nova trả một patch
+                            với các key <code>customerType</code>, <code>deposit</code>, <code>cycle</code>,
+                            <code>rooms</code>, <code>currency</code> và <code>fee</code>. Chỉ key có
+                            <code>confidence: high</code> và đúng schema mới được ghi vào payload. Kết quả không chắc
+                            hiện trên màn hình, không sửa payload.</td>
+                    </tr>
+                    <tr>
+                        <td>Completed</td>
+                        <td>Mỗi payment period có <code>endDate</code> trước ngày chạy file được xuất một invoice.
+                            <code>issueDate</code> và <code>transactionDate</code> là <code>startDate</code> của period
+                            đó. Payment method mặc định là Transfer. <code>completeBooking</code> chỉ chạy khi
+                            <code>endTime</code> của booking cũng trước ngày chạy file. Cột “Mẫu hợp đồng” được đối chiếu
+                            với tên trong <code>contracttemplates</code>, rồi <code>createContract</code> ghi số hợp đồng
+                            và <code>contractTemplateId</code>.
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <div class="nav" id="nav">1 / 3</div>
+        <script>
+            const slides = [...document.querySelectorAll(".slide")];
+            let index = 0;
+            const nav = document.getElementById("nav");
+            function show(next) {
+                index = (next + slides.length) % slides.length;
+                slides.forEach((slide, i) => slide.classList.toggle("active", i === index));
+                nav.textContent = `${index + 1} / ${slides.length}`;
+            }
+            document.addEventListener("keydown", (event) => {
+                if (event.key === "ArrowRight" || event.key === "PageDown" || event.key === " ") show(index + 1);
+                if (event.key === "ArrowLeft" || event.key === "PageUp") show(index - 1);
+            });
+        </script>
+</body>
+
+</html>
