@@ -3,8 +3,8 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   async rewrites() {
     return [
-      { source: "/api/preview", destination: "http://127.0.0.1:8000/preview" },
-      { source: "/api/health", destination: "http://127.0.0.1:8000/health" },
+      { source: "/api/preview", destination: "https://smartos-migrate-onboarding-data.vercel.app/preview" },
+      { source: "/api/health", destination: "https://smartos-migrate-onboarding-data.vercel.app/health" },
     ];
   },
 };
