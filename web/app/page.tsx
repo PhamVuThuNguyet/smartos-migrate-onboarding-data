@@ -20,23 +20,18 @@ type ApiCall = {
   previewNote?: string;
 };
 
-type Suggestion = {
-  id: string;
-  kind: string;
-  text: string;
-  parser: string;
-  value: unknown;
-  confidence: string;
-  reason: string;
-  applied: boolean;
+type ImportIssue = {
+  code: string;
+  row: number | null;
+  column: string | null;
+  message: string;
 };
 
 type PreviewResponse = {
   asOf: string;
+  errors: ImportIssue[];
   calls: ApiCall[];
   skipped: ImportStep[];
-  suggestions: Suggestion[];
-  reviewError: string;
   error: string;
 };
 
@@ -152,15 +147,6 @@ function originalName(input: Record<string, unknown>) {
   return "";
 }
 
-function bookingNote(note: unknown) {
-  const parts = String(note ?? "").replace(/^import:/, "").split("|");
-  return {
-    building: parts[0] ?? "",
-    service: parts[1] ?? "",
-    contract: parts[3] ?? "",
-  };
-}
-
 function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
   const input = call.input;
   const place = (value: unknown) => refTitle(calls, value);
@@ -209,15 +195,13 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
     return [place(input.roomId), prices];
   }
   if (call.mutation === "createBooking") {
-    const note = bookingNote(input.note);
     const settings = input.paymentSettings as { duration?: number } | undefined;
     const deposit = input.deposit as { requiredAmount?: number } | undefined;
     const roomCount = Array.isArray(input.rooms) ? input.rooms.length : 0;
     return [
       place(input.primaryCustomerId),
-      note.building,
-      note.service,
-      note.contract,
+      place(input.locationId),
+      String(input.note ?? ""),
       displayDate(input.startTime),
       displayDate(input.endTime),
       settings?.duration ? `${settings.duration} tháng` : "",
@@ -284,7 +268,7 @@ const SALES_COLUMNS: Record<string, string[]> = {
   createCompany: ["Khách", "Email", "MST", "Người đại diện", "Tòa"],
   createIndividual: ["Khách", "Email", "Tòa"],
   mutatePackages: ["Phòng", "Đơn giá"],
-  createBooking: ["Khách", "Tòa", "Dịch vụ", "Hợp đồng", "Bắt đầu", "Kết thúc", "Kỳ", "Cọc", "Số phòng", "Tiền tệ"],
+  createBooking: ["Khách", "Tòa", "Ghi chú", "Bắt đầu", "Kết thúc", "Kỳ", "Cọc", "Số phòng", "Tiền tệ"],
   updateBookingRoomServices: ["Booking", "Phí dịch vụ/tháng", "Đơn vị"],
   createInvoices: ["Booking", "Ngày phát hành", "Hạn thanh toán", "Số dòng"],
   createInvoicePaymentTransaction: ["Khách", "Số tiền", "Ngày", "Phương thức"],
@@ -322,26 +306,44 @@ const SALES_COLUMNS: Record<string, string[]> = {
             <span>
               <strong>{preview.skipped.length}</strong> dòng bỏ qua
             </span>
+            <span>
+              <strong>{preview.errors.length}</strong> lỗi
+            </span>
           </section>
-          <p className="note">
-            Đây là input gửi vào mutation. id, uniqueKey, searchText và mã BK, INV, TX, COM do API
-            sinh.
-          </p>
-          {preview.reviewError ? <p className="note">{preview.reviewError}</p> : null}
-          {preview.suggestions?.length ? (
+          {preview.errors.length > 0 ? (
             <section className="panel warnings">
-              <h2>AI đã gợi ý chỉnh sửa {preview.suggestions.length} records.</h2>
-              <ul>
-                {preview.suggestions.map((item) => (
-                  <li key={item.id}>
-                    <strong>{item.applied ? "Đã sửa payload" : "Giữ parser"}</strong> {item.kind} “{item.text}”
-                    {" → "}
-                    {JSON.stringify(item.value)} ({item.confidence}). {item.reason} Parser trước đó: {item.parser}.
-                  </li>
-                ))}
-              </ul>
+              <h2>
+                File chưa nhập được: {preview.errors.length} lỗi. Sửa trong file Excel rồi tải lại.
+              </h2>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Mã lỗi</th>
+                      <th>Dòng</th>
+                      <th>Cột</th>
+                      <th>Thông báo</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.errors.map((item, index) => (
+                      <tr key={`${item.code}-${item.row}-${index}`}>
+                        <td>{item.code}</td>
+                        <td>{item.row ?? ""}</td>
+                        <td>{item.column ?? ""}</td>
+                        <td>{item.message}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </section>
-          ) : null}
+          ) : (
+            <p className="note">
+              Đây là input gửi vào mutation. id, uniqueKey, searchText và mã BK, INV, TX, COM do API
+              sinh.
+            </p>
+          )}
           {preview.skipped.length > 0 ? (
             <section className="panel warnings">
               <h2>{preview.skipped.length} records đã bỏ qua</h2>
@@ -370,72 +372,74 @@ const SALES_COLUMNS: Record<string, string[]> = {
             </section>
           ) : null}
 
-          <section className="panel workspace">
-            <ul className="table-list">
-              {groups.map(([name, calls]) => (
-                <li key={name}>
-                  <button
-                    type="button"
-                    className={name === activeMutation ? "active" : ""}
-                    onClick={() => {
-                      setSelectedMutation(name);
-                      setQuery("");
-                    }}
-                  >
-                    {name}
-                    <span className="count">
-                      {DATABASE_TABLES[name] ?? calls[0]?.service} · {calls.length} lệnh
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-            <div className="grid-pane">
-              <div className="grid-toolbar">
-                <div>
-                  <h2>{activeMutation}</h2>
-                  <p>
-                    {DATABASE_TABLES[activeMutation] ?? ""}
-                    {visibleCalls.length ? ` · ${visibleCalls.length} lệnh` : ""}
-                    {activeCalls[0]?.apiFills.length
-                      ? ` · API tự sinh: ${activeCalls[0].apiFills.join(", ")}`
-                      : ""}
-                    {activeCalls[0]?.previewNote ? ` · ${activeCalls[0].previewNote}` : ""}
-                    . Bấm một dòng để xem input.
-                  </p>
+          {preview.calls.length > 0 ? (
+            <section className="panel workspace">
+              <ul className="table-list">
+                {groups.map(([name, calls]) => (
+                  <li key={name}>
+                    <button
+                      type="button"
+                      className={name === activeMutation ? "active" : ""}
+                      onClick={() => {
+                        setSelectedMutation(name);
+                        setQuery("");
+                      }}
+                    >
+                      {name}
+                      <span className="count">
+                        {DATABASE_TABLES[name] ?? calls[0]?.service} · {calls.length} lệnh
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="grid-pane">
+                <div className="grid-toolbar">
+                  <div>
+                    <h2>{activeMutation}</h2>
+                    <p>
+                      {DATABASE_TABLES[activeMutation] ?? ""}
+                      {visibleCalls.length ? ` · ${visibleCalls.length} lệnh` : ""}
+                      {activeCalls[0]?.apiFills.length
+                        ? ` · API tự sinh: ${activeCalls[0].apiFills.join(", ")}`
+                        : ""}
+                      {activeCalls[0]?.previewNote ? ` · ${activeCalls[0].previewNote}` : ""}
+                      . Bấm một dòng để xem input.
+                    </p>
+                  </div>
+                  <div className="toolbar-actions">
+                    <input
+                      value={query}
+                      placeholder="Lọc trong nhóm này"
+                      onChange={(event) => setQuery(event.target.value)}
+                    />
+                  </div>
                 </div>
-                <div className="toolbar-actions">
-                  <input
-                    value={query}
-                    placeholder="Lọc trong nhóm này"
-                    onChange={(event) => setQuery(event.target.value)}
-                  />
-                </div>
-              </div>
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      {(SALES_COLUMNS[activeMutation] ?? []).map((column) => (
-                        <th key={column}>{column}</th>
-                      ))}
-                      <th>API payload</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleCalls.map((call, index) => (
-                      <tr key={`${call.mutation}-${index}`} onClick={() => setPayloadCall(call)}>
-                        {salesCells(call, preview?.calls ?? []).map((value, cellIndex) => (
-                          <td key={cellIndex}>{value}</td>
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        {(SALES_COLUMNS[activeMutation] ?? []).map((column) => (
+                          <th key={column}>{column}</th>
                         ))}
-                        <td>{JSON.stringify(call.input)}</td>
+                        <th>API payload</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {visibleCalls.map((call, index) => (
+                        <tr key={`${call.mutation}-${index}`} onClick={() => setPayloadCall(call)}>
+                          {salesCells(call, preview?.calls ?? []).map((value, cellIndex) => (
+                            <td key={cellIndex}>{value}</td>
+                          ))}
+                          <td>{JSON.stringify(call.input)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
-            </div>
-          </section>
+            </section>
+          ) : null}
         </>
       ) : null}
       {payloadCall ? (

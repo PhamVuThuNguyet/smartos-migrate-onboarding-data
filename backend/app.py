@@ -1,5 +1,6 @@
 """HTTP API for the preview UI. Next.js calls POST /preview."""
 
+from datetime import date
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -7,6 +8,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from import_api import preview_workbook
+from onboarding import issue
 
 app = FastAPI(title="SmartOS onboarding preview")
 app.add_middleware(
@@ -17,17 +19,14 @@ app.add_middleware(
 )
 
 
-async def save_upload(upload: UploadFile) -> Path:
-    filename = (upload.filename or "").lower()
-    if not filename.endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Chỉ nhận file Excel .xlsx")
-    content = await upload.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="File trống")
-    temporary = NamedTemporaryFile(suffix=".xlsx", delete=False)
-    temporary.write(content)
-    temporary.close()
-    return Path(temporary.name)
+def rejected_file() -> dict:
+    return {
+        "asOf": date.today().isoformat(),
+        "errors": [issue("E01", "File không đúng định dạng .xlsx")],
+        "calls": [],
+        "skipped": [],
+        "error": "",
+    }
 
 
 @app.get("/health")
@@ -37,7 +36,13 @@ def health():
 
 @app.post("/preview")
 async def preview_records(file: UploadFile = File(...)):
-    path = await save_upload(file)
+    content = await file.read()
+    if not (file.filename or "").lower().endswith(".xlsx") or not content:
+        return rejected_file()
+    temporary = NamedTemporaryFile(suffix=".xlsx", delete=False)
+    temporary.write(content)
+    temporary.close()
+    path = Path(temporary.name)
     try:
         return preview_workbook(path)
     except Exception as error:

@@ -1,12 +1,12 @@
-"""Parse an onboarding Excel workbook into contracts.
+"""Read the onboarding template, validate it, and group booked rows into bookings.
 
-The data sheet is found by header names, not by the active sheet. The as-of
-date is the day the file is read. This module does not call the API.
+Checks run in two layers. File errors (E01-E03) stop the read. Row errors are
+collected so the user fixes the file in one pass. The as-of date is the day the
+file is read. This module does not call the API.
 """
 
 from __future__ import annotations
 
-import hashlib
 import math
 import re
 import unicodedata
@@ -15,57 +15,37 @@ from pathlib import Path
 
 import openpyxl
 
-# Column indexes are 1-based, matching openpyxl. The header row is detected, not fixed.
-COL = {
-    "stt": 2,
-    "name": 3,
-    "building": 4,
-    "service": 5,
-    "floor": 6,
-    "room": 7,
-    "email": 8,
-    "area": 9,
-    "rent": 10,
-    "fee": 11,
-    "currency": 12,
-    "tax": 13,
-    "start": 14,
-    "end": 15,
-    "contract_status": 17,
-    "deposit_label": 18,
-    "deposit_amount": 19,
-    "cycle": 20,
-    "fx": 24,
-    "contract_no": 26,
-    "activity": 27,
-    "note": 28,
-}
-
-# Fallback address and coordinates for known buildings. Not a surveyed location.
-BUILDING_DUMMY = {
-    "ATHENA": {
-        "address": "Tòa ATHENA, TP. Hồ Chí Minh",
-        "city": "Hồ Chí Minh",
-        "lng": 106.7008,
-        "lat": 10.7796,
-    },
-    "ARTEMIS": {
-        "address": "Tòa ARTEMIS, quận Thanh Xuân, Hà Nội",
-        "city": "Hà Nội",
-        "lng": 105.8195,
-        "lat": 20.9987,
-    },
-    "738 VÕ VĂN KIỆT": {
-        "address": "738 Võ Văn Kiệt, TP. Hồ Chí Minh",
-        "city": "Hồ Chí Minh",
-        "lng": 106.6672,
-        "lat": 10.7554,
-    },
-}
-
-
-def did(kind: str, key: str) -> str:
-    return hashlib.md5(f"{kind}:{key}".encode("utf-8")).hexdigest()[:24]
+# Template columns, in order. A header matches when it starts with the label; `*` is ignored.
+COLUMNS = (
+    ("building", "Toà nhà"),
+    ("floor", "Tầng"),
+    ("room", "Khu vực/phòng"),
+    ("area", "Diện tích (m2)"),
+    ("service", "Dịch vụ cung cấp"),
+    ("rent", "Đơn giá cho thuê/tháng"),
+    ("fee", "Đơn giá phí dịch vụ mặc định/tháng"),
+    ("currency", "Đơn vị tiền tệ"),
+    ("fx", "Tỷ giá"),
+    ("name", "Tên khách hàng"),
+    ("tax", "MST"),
+    ("email", "Email"),
+    ("start", "Ngày bắt đầu"),
+    ("end", "Ngày kết thúc"),
+    ("deposit", "Tiền cọc"),
+    ("cycle", "Kỳ thanh toán"),
+    ("contract_no", "Số hợp đồng"),
+    ("template", "Mẫu hợp đồng"),
+    ("note", "Ghi chú đặt chỗ"),
+    ("main", "Đặt chỗ chính"),
+)
+LABELS = dict(COLUMNS)
+REQUIRED = ("building", "room", "area", "service", "rent")
+# Rows of one booking must agree on these columns (E12).
+BOOKING_FIELDS = ("email", "fx", "deposit", "contract_no", "template", "note", "main")
+HEADER_SCAN_ROWS = 10
+HEADER_SCAN_COLUMNS = 60
+TRUE_FLAGS = {"co", "x", "true", "yes", "1"}
+FALSE_FLAGS = {"", "khong", "false", "no", "0"}
 
 
 def blank(value) -> bool:
@@ -86,36 +66,79 @@ def slug(value: str) -> str:
     return raw or "unknown"
 
 
-def as_date(value) -> date | None:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    return None
+def issue(code: str, message: str, row: int | None = None, column: str | None = None) -> dict:
+    return {"code": code, "row": row, "column": column, "message": message}
 
 
-def parse_number(value):
-    """Return a float, the string 'ACC', or None when the cell is not a number."""
+def parse_number(value) -> float | None:
     if blank(value) or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         if isinstance(value, float) and math.isnan(value):
             return None
         return float(value)
-    raw = str(value).strip()
-    if raw.upper() == "ACC":
-        return "ACC"
-    compact = raw.replace(" ", "")
+    compact = str(value).strip().replace(" ", "")
     if "," in compact and "." in compact:
         compact = compact.replace(",", "")
     elif re.fullmatch(r"\d{1,3}(,\d{3})+", compact):
         compact = compact.replace(",", "")
-    elif "," in compact and "." not in compact:
+    elif "," in compact:
         compact = compact.replace(",", ".")
     try:
         return float(compact)
     except ValueError:
         return None
+
+
+def parse_date(value) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = text(value) or ""
+    for pattern in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, pattern).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_currency(value) -> str | None:
+    return {"vnd": "VND", "usd": "USD"}.get(slug(str(value or "")))
+
+
+def parse_flag(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    key = slug(str(value or "")) if not blank(value) else ""
+    if key in TRUE_FLAGS:
+        return True
+    if key in FALSE_FLAGS:
+        return False
+    return None
+
+
+def parse_cycle(value) -> tuple[str, int | None] | None:
+    """Return ("months", n) or ("full", None). None when the cell is not a known cycle."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return ("months", int(value)) if value > 0 and float(value).is_integer() else None
+    raw = (text(value) or "").lower()
+    if "toàn bộ" in raw:
+        return "full", None
+    match = re.search(r"\d+", raw)
+    count = int(match.group()) if match else 1
+    if count <= 0:
+        return None
+    if "quý" in raw:
+        return "months", 3 * count
+    if "năm" in raw:
+        return "months", 12 * count
+    if "tháng" in raw or re.fullmatch(r"\d+", raw):
+        return "months", count
+    return None
 
 
 def split_emails(value) -> list[str]:
@@ -151,343 +174,263 @@ def looks_like_company(name: str | None) -> bool:
     return any(phrase in key for phrase in phrases)
 
 
-def parse_cycle(value) -> tuple[str, int | None]:
-    raw = (text(value) or "").lower()
-    if "toàn bộ" in raw:
-        return "full", None
-    if "quý" in raw:
-        return "months", 3
-    if "năm" in raw:
-        return "months", 12
-    match = re.search(r"(\d+)", raw)
-    if match and "tháng" in raw:
-        return "months", int(match.group(1))
-    if "tháng" in raw:
-        return "months", 1
-    return "months", 1
+def header_matches(value, label: str) -> bool:
+    if blank(value):
+        return False
+    found = slug(str(value).replace("*", ""))
+    expected = slug(label)
+    return found == expected or found.startswith(expected + "-")
 
 
-def unit_price_from_formula(formula, fallback_total, area) -> tuple[str, float | None]:
-    """A formula `=unitPrice*I{row}` is per square meter. A numeric cell is a flat monthly total."""
-    if isinstance(formula, str) and formula.startswith("="):
-        if re.search(r"\*\s*I\d+", formula, re.I):
-            match = re.search(r"([\d.]+)\s*\*", formula)
-            if match:
-                return "per-square-meter", float(match.group(1))
-            if isinstance(fallback_total, float) and area:
-                return "per-square-meter", fallback_total / area
-        if isinstance(fallback_total, float):
-            return "per-room", fallback_total
-    if isinstance(fallback_total, float):
-        return "per-room", fallback_total
-    return "per-room", None
+def locate_header(workbook):
+    """The sheet and header row that match the most template labels."""
+    best = (0, workbook.worksheets[0], 1)
+    for sheet in workbook.worksheets:
+        last_column = min(sheet.max_column or 1, HEADER_SCAN_COLUMNS)
+        for row in range(1, min(sheet.max_row or 1, HEADER_SCAN_ROWS) + 1):
+            cells = [sheet.cell(row, column).value for column in range(1, last_column + 1)]
+            hits = sum(1 for _key, label in COLUMNS if any(header_matches(cell, label) for cell in cells))
+            if hits > best[0]:
+                best = (hits, sheet, row)
+    return best[1], best[2]
 
 
-HEADER_MARKS = {
-    "stt": ("stt",),
-    "name": ("khach",),
-    "building": ("toa",),
-    "room": ("phong", "khu"),
-    "rent": ("gia", "thue"),
-}
+def check_file(sheet, header_row: int) -> tuple[int, list[dict]]:
+    """E02 for each template column out of place, E03 for each merged range. Returns the first column."""
+    errors = []
+    first_column = 1
+    while first_column < HEADER_SCAN_COLUMNS and blank(sheet.cell(header_row, first_column).value):
+        first_column += 1
+    for offset, (_key, label) in enumerate(COLUMNS):
+        cell = sheet.cell(header_row, first_column + offset)
+        if header_matches(cell.value, label):
+            continue
+        found = text(cell.value)
+        where = f'ô {cell.coordinate} đang là "{found}"' if found else f"ô {cell.coordinate} đang trống"
+        errors.append(issue("E02", f'Cột "{label}" không đúng mẫu ({where})', column=label))
+    for merged in sheet.merged_cells.ranges:
+        if merged.max_row >= header_row:
+            errors.append(issue("E03", f"Ô {merged.coord} đang bị merge, vui lòng bỏ merge"))
+    return first_column, errors
 
 
-def sheet_header_row(worksheet):
-    """Find the header row by column names. Does not depend on which sheet is active."""
-    for row_index in range(1, 11):
-        matched = True
-        for key, marks in HEADER_MARKS.items():
-            folded = slug(str(worksheet.cell(row_index, COL[key]).value or ""))
-            if not any(mark in folded for mark in marks):
-                matched = False
-                break
-        if matched:
-            return row_index
-    return None
+def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
+    errors: list[dict] = []
 
+    def fail(code: str, key: str, message: str):
+        errors.append(issue(code, message, number, LABELS[key]))
 
-def find_data_sheet(workbook):
-    for worksheet in workbook.worksheets:
-        header_row = sheet_header_row(worksheet)
-        if header_row:
-            return worksheet, header_row
-    raise ValueError(
-        "Không thấy hàng tiêu đề đúng format cột: STT, khách, tòa, khu vực/phòng, đơn giá"
-    )
+    for key in REQUIRED:
+        if blank(raw[key]):
+            fail("E04", key, f'Dòng {number}: cột "{LABELS[key]}" bắt buộc nhập')
 
+    area = parse_number(raw["area"])
+    if not blank(raw["area"]) and not (area and area > 0):
+        fail("E05", "area", f"Dòng {number}: Diện tích phải là số lớn hơn 0")
+    rent = parse_number(raw["rent"])
+    if not blank(raw["rent"]) and not (rent and rent > 0):
+        fail("E14", "rent", f'Dòng {number}: cột "{LABELS["rent"]}" phải là số lớn hơn 0')
+    fee_text = (text(raw["fee"]) or "").lower()
+    fee = 0.0 if not fee_text or "không" in fee_text else parse_number(raw["fee"])
+    if fee is None or fee < 0:
+        fail("E14", "fee", f'Dòng {number}: cột "{LABELS["fee"]}" phải là số không âm')
 
-def header_column(worksheet, header_row: int, marks: tuple[str, ...]) -> int | None:
-    """Return the 1-based column whose header contains every mark."""
-    for column in range(1, (worksheet.max_column or 1) + 1):
-        folded = slug(str(worksheet.cell(header_row, column).value or ""))
-        if folded and all(mark in folded for mark in marks):
-            return column
-    return None
+    currency = parse_currency(raw["currency"])
+    fx = parse_number(raw["fx"])
+    if currency is None:
+        fail("E06", "currency", f"Dòng {number}: Đơn vị tiền tệ chỉ nhận VNĐ hoặc USD")
+    elif currency == "USD" and not (fx and fx > 0):
+        fail("E07", "fx", f"Dòng {number}: Tỷ giá bắt buộc khi tiền tệ là USD")
+    elif currency == "VND" and not blank(raw["fx"]):
+        fail("E08", "fx", f"Dòng {number}: Tỷ giá phải để trống khi tiền tệ là VNĐ")
 
-
-def load_rows(path: Path):
-    values_book = openpyxl.load_workbook(path, data_only=True)
-    formulas_book = openpyxl.load_workbook(path, data_only=False)
-    values, header_row = find_data_sheet(values_book)
-    formulas = formulas_book[values.title]
-    template_column = header_column(values, header_row, ("mau", "hop-dong"))
-    # As-of is the run date. Excel cell P2 is often =TODAY(); openpyxl only sees the cached value.
-    as_of = date.today()
-    rows = []
-    for index in range(header_row + 1, values.max_row + 1):
-        item = {"row": index, "template": None}
-        empty = True
-        for key, column in COL.items():
-            item[key] = values.cell(index, column).value
-            if not blank(item[key]):
-                empty = False
-        if template_column:
-            item["template"] = values.cell(index, template_column).value
-            if not blank(item["template"]):
-                empty = False
-        item["rent_formula"] = formulas.cell(index, COL["rent"]).value
-        item["fee_formula"] = formulas.cell(index, COL["fee"]).value
-        if not empty:
-            rows.append(item)
-    return as_of, rows
-
-
-def expand_room_names(label: str) -> list[str]:
-    """Split ranges and combined labels into individual rooms.
-
-    T501 -> T506 becomes T501..T506. 1A+B becomes 1A and 1B.
-    T221-224 + Hlang becomes T221..T224 and Hành lang.
-    Names separated by a comma, semicolon, or slash become separate places.
-    One descriptive name with no separator stays one zone.
-    """
-
-    def room_code(value: str) -> bool:
-        return bool(re.fullmatch(r"[A-Za-z]*\d+(?:\.\d+)?[A-Za-z]?", value.strip()))
-
-    def area_alias(token: str) -> str:
-        key = slug(token)
-        aliases = {
-            "hlang": "Hành lang",
-            "hanh-lang": "Hành lang",
-            "hanh lang": "Hành lang",
-        }
-        return aliases.get(key, token.strip())
-
-    def expand_range(segment: str) -> list[str] | None:
-        match = re.match(
-            r"^([A-Za-z]*)(\d+)(?:\.(\d+))?\s*(?:->|→|–|—|-)\s*([A-Za-z]*)(\d+)(?:\.(\d+))?\s*(.*)$",
-            segment.strip(),
-            re.IGNORECASE,
-        )
-        if not match:
-            return None
-        prefix, major, minor, prefix_end, major_end, minor_end, suffix = match.groups()
-        prefix = prefix.upper()
-        prefix_end = prefix_end.upper() or prefix
-        if prefix != prefix_end:
-            return None
-        suffix = re.sub(r"^[\s.+-]+", "", suffix or "").strip()
-        if minor or minor_end:
-            if not (minor and minor_end and major == major_end):
-                return None
-            start, end = int(minor), int(minor_end)
-            if end < start or end - start > 80:
-                return None
-            names = [f"{prefix}{major}.{number}" for number in range(start, end + 1)]
-        else:
-            start, end = int(major), int(major_end)
-            if end < start or end - start > 80:
-                return None
-            names = [f"{prefix}{number}" for number in range(start, end + 1)]
-        if suffix:
-            names.append(area_alias(suffix))
-        return names
-
-    def expand_segment(segment: str) -> list[str]:
-        pieces = [piece.strip() for piece in re.split(r"\s*-\s*", segment) if piece.strip()]
-        if len(pieces) > 2 and all(room_code(piece) for piece in pieces):
-            return pieces
-        expanded = expand_range(segment)
-        if expanded:
-            return expanded
-        if len(pieces) == 2 and all(room_code(piece) for piece in pieces):
-            return pieces
-        return [segment.strip()]
-
-    def expand_plus(segment: str) -> list[str]:
-        bits = [bit.strip() for bit in re.split(r"\s*\+\s*", segment) if bit.strip()]
-        if len(bits) == 1:
-            return expand_segment(bits[0])
-        sibling = re.fullmatch(r"(\d+)([A-Za-z](?:\.\d+)?)", bits[0])
-        if sibling and all(re.fullmatch(r"[A-Za-z]", bit) for bit in bits[1:]):
-            number, suffix = sibling.groups()
-            return [f"{number}{suffix}"] + [f"{number}{bit.upper()}" for bit in bits[1:]]
-        names = expand_segment(bits[0])
-        names.extend(area_alias(bit) for bit in bits[1:])
-        return names
-
-    parts = [part.strip() for part in re.split(r"\s*(?:,|;|&|/)\s*", label) if part.strip()]
-    if not parts:
-        return [label]
-    if len(parts) == 1:
-        return expand_plus(parts[0])
-    expanded: list[str] = []
-    for part in parts:
-        expanded.extend(expand_plus(part))
-    return expanded or [label]
-
-
-def space_from_row(row) -> dict:
-    area_num = parse_number(row["area"])
-    area = area_num if isinstance(area_num, float) and area_num > 0 else None
-    rent_num = parse_number(row["rent"])
-    fee_raw = text(row["fee"])
-    if fee_raw and "không thu" in fee_raw.lower():
-        fee_num = 0.0
-    else:
-        fee_num = parse_number(row["fee"])
-    price_type, unit_price = unit_price_from_formula(
-        row["rent_formula"], rent_num if isinstance(rent_num, float) else None, area
-    )
-    return {
-        "row": row["row"],
-        "floor": text(row["floor"]) or "Không rõ tầng",
-        "room": text(row["room"]) or f"Khu vực dòng {row['row']}",
+    space = {
+        "row": number,
+        "building": text(raw["building"]),
+        "floor": text(raw["floor"]) or "Không rõ tầng",
+        "room": text(raw["room"]),
         "area": area,
-        "area_raw": text(row["area"]),
-        "area_dummy": area is None,
-        "rent": rent_num if isinstance(rent_num, float) else None,
-        "rent_blocked": rent_num == "ACC",
-        "price_type": price_type,
-        "unit_price": unit_price,
-        "fee": fee_num if isinstance(fee_num, float) else None,
-        "fee_raw": fee_raw,
-        "floor_dummy": blank(row["floor"]),
-        "room_dummy": blank(row["room"]),
+        "service": text(raw["service"]),
+        "rent": rent,
+        "fee": fee or 0.0,
+        "currency": currency,
+        "fx": fx if currency == "USD" else None,
+        "name": text(raw["name"]),
     }
+    if not space["name"]:
+        return space, errors
+
+    name = space["name"]
+    missing = [key for key in ("start", "end", "cycle") if blank(raw[key])]
+    if missing:
+        columns = ", ".join(f'"{LABELS[key]}"' for key in missing)
+        fail("E09", missing[0], f'Dòng {number}: thiếu thông tin thuê của khách "{name}" (cột {columns})')
+    start = parse_date(raw["start"])
+    end = parse_date(raw["end"])
+    for key, value in (("start", start), ("end", end)):
+        if not blank(raw[key]) and value is None:
+            fail("E10", key, f'Dòng {number}: cột "{LABELS[key]}" sai định dạng ngày')
+    if start and end and end <= start:
+        fail("E10", "end", f"Dòng {number}: ngày kết thúc phải sau ngày bắt đầu")
+    cycle = parse_cycle(raw["cycle"])
+    if not blank(raw["cycle"]) and cycle is None:
+        fail(
+            "E14",
+            "cycle",
+            f'Dòng {number}: cột "Kỳ thanh toán" không đọc được, dùng Hàng tháng, 3 tháng, Hàng quý, Hàng năm '
+            "hoặc Đã thanh toán toàn bộ",
+        )
+    deposit = 0.0 if blank(raw["deposit"]) else parse_number(raw["deposit"])
+    if deposit is None or deposit < 0:
+        fail("E14", "deposit", f'Dòng {number}: cột "Tiền cọc" phải là số không âm')
+    main = parse_flag(raw["main"])
+    if main is None:
+        fail("E14", "main", f'Dòng {number}: cột "Đặt chỗ chính" chỉ nhận "Có" hoặc để trống')
+
+    space.update({
+        "tax": norm_tax(raw["tax"]),
+        "email": sorted(set(split_emails(raw["email"]))),
+        "start": start,
+        "end": end,
+        "cycle": cycle,
+        "deposit": deposit or 0.0,
+        "contract_no": text(raw["contract_no"]),
+        "template": text(raw["template"]),
+        "note": text(raw["note"]),
+        "main": bool(main),
+    })
+    return space, errors
 
 
-def spaces_from_row(row) -> list[dict]:
-    space = space_from_row(row)
-    names = expand_room_names(space["room"])
-    if len(names) <= 1:
-        if names:
-            space["room"] = names[0]
-        return [space]
-    count = len(names)
-    clones = []
-    for name in names:
-        clone = dict(space)
-        clone["room"] = name
-        if space["area"]:
-            clone["area"] = space["area"] / count
-        if space["rent"] is not None:
-            clone["rent"] = space["rent"] / count
-        if isinstance(space["fee"], float):
-            clone["fee"] = space["fee"] / count
-        if space["price_type"] == "per-room" and space["unit_price"] is not None:
-            clone["unit_price"] = space["unit_price"] / count
-        clones.append(clone)
-    return clones
-
-
-def row_has_space(row) -> bool:
-    return not all(blank(row[key]) for key in ("floor", "room", "area", "rent", "fee"))
-
-
-def group_contracts(rows: list[dict]) -> list[dict]:
-    """A row with STT starts a contract. A following row without STT joins it.
-
-    The continuation becomes its own contract when the contract number, service,
-    or start date differs from the contract above.
-    """
-    contracts: list[dict] = []
-    current = None
-
-    def start(row, inherited=None):
-        source = inherited or {}
-        contract = {
-            "stt": row["stt"] if not blank(row["stt"]) else source.get("stt"),
-            "name": text(row["name"]) or source.get("name"),
-            "building": text(row["building"]) or source.get("building"),
-            "service": text(row["service"]) or source.get("service"),
-            "emails": split_emails(row["email"]) or list(source.get("emails") or []),
-            "tax": norm_tax(row["tax"]) or source.get("tax"),
-            "start": as_date(row["start"]) or source.get("start"),
-            "end": as_date(row["end"]) or source.get("end"),
-            "currency": text(row["currency"]) or source.get("currency"),
-            "cycle": text(row["cycle"]) or source.get("cycle"),
-            "deposit_label": row["deposit_label"] if not blank(row["deposit_label"]) else source.get("deposit_label"),
-            "deposit_amount": row["deposit_amount"] if not blank(row["deposit_amount"]) else None,
-            "fx": text(row["fx"]) or source.get("fx"),
-            "contract_no": text(row["contract_no"]) or None,
-            "template": text(row.get("template")) or source.get("template"),
-            "contract_status": text(row["contract_status"]) or source.get("contract_status"),
-            "activity": text(row["activity"]) or source.get("activity"),
-            "note": text(row["note"]) or source.get("note"),
-            "spaces": [],
-            "warnings": [],
-        }
-        if inherited and contract["contract_no"] is None:
-            contract["contract_no"] = source.get("contract_no")
-        if row_has_space(row):
-            contract["spaces"].extend(spaces_from_row(row))
-        contracts.append(contract)
-        return contract
-
-    for row in rows:
-        if not blank(row["stt"]):
-            current = start(row)
+def duplicate_rooms(spaces: list[dict]) -> list[dict]:
+    """E11: a room name appears twice in one building."""
+    errors = []
+    seen: dict[tuple[str, str], int] = {}
+    for space in spaces:
+        if not space["building"] or not space["room"]:
             continue
-        if current is None or not row_has_space(row):
-            continue
-        different_contract = text(row["contract_no"]) and text(row["contract_no"]) != current["contract_no"]
-        different_service = text(row["service"]) and text(row["service"]) != current["service"]
-        different_start = as_date(row["start"]) and as_date(row["start"]) != current["start"]
-        if different_contract or different_service or different_start:
-            current = start(row, current)
+        key = (slug(space["building"]), slug(space["room"]))
+        if key in seen:
+            errors.append(issue(
+                "E11",
+                f'Dòng {space["row"]}: phòng "{space["room"]}" bị trùng với dòng {seen[key]}',
+                space["row"],
+                LABELS["room"],
+            ))
         else:
-            current["spaces"].extend(spaces_from_row(row))
-    return contracts
+            seen[key] = space["row"]
+    return errors
 
 
-def currency_code(value, warnings: list[str]) -> str:
-    raw = (value or "").upper()
-    if "USD" in raw:
-        return "usd"
-    if "VN" in raw:
-        return "vnd"
-    warnings.append(f"Thiếu loại giá, dummy currency=vnd (ô: {value})")
-    return "vnd"
+def customer_of(space: dict) -> tuple[str, str | None]:
+    return slug(space["name"]), space["tax"]
 
 
-def deposit_amount(contract, monthly_rent: float) -> tuple[float, list[str]]:
-    warnings = []
-    label = contract["deposit_label"]
-    amount = parse_number(contract["deposit_amount"])
-    if isinstance(amount, float):
-        return amount, warnings
-    label_num = parse_number(label)
-    if label_num == "ACC":
-        warnings.append("Cọc ghi ACC, dummy requiredDepositAmount=0")
-        return 0.0, warnings
-    if isinstance(label_num, float) and label_num > 36:
-        warnings.append("Cột số tháng cọc đang là số tiền, dùng số đó làm tiền cọc")
-        return label_num, warnings
-    raw = (text(label) or "").lower()
-    if "không" in raw:
-        return 0.0, warnings
-    match = re.search(r"(\d+)", raw)
-    if match:
-        months = int(match.group(1))
-        if monthly_rent <= 0:
-            warnings.append("Có số tháng cọc nhưng chưa có tiền thuê, dummy tiền cọc=0")
-            return 0.0, warnings
-        return months * monthly_rent, warnings
-    warnings.append("Không đọc được tiền cọc, dummy requiredDepositAmount=0")
-    return 0.0, warnings
+def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Rows of one customer (name and tax code) with the same start and end date form one booking.
+
+    A booking has one location, one payment cycle and one currency, so rows
+    that differ there become separate bookings.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for space in spaces:
+        if not space["name"]:
+            continue
+        key = (
+            slug(space["building"]),
+            *customer_of(space),
+            space["start"],
+            space["end"],
+            space["cycle"],
+            space["currency"],
+        )
+        groups.setdefault(key, []).append(space)
+
+    errors = []
+    bookings = []
+    for members in groups.values():
+        first = members[0]
+        for space in members[1:]:
+            different = [LABELS[key] for key in BOOKING_FIELDS if space[key] != first[key]]
+            if different:
+                columns = ", ".join(f'"{label}"' for label in different)
+                errors.append(issue(
+                    "E12",
+                    f'Dòng {space["row"]}: thông tin Booking không khớp với dòng {first["row"]} (cột {columns})',
+                    space["row"],
+                    different[0],
+                ))
+        bookings.append({
+            "rows": [space["row"] for space in members],
+            "building": first["building"],
+            "service": " + ".join(dict.fromkeys(space["service"] for space in members)),
+            "name": first["name"],
+            "tax": first["tax"],
+            "emails": first["email"],
+            "start": first["start"],
+            "end": first["end"],
+            "cycle": first["cycle"],
+            "currency": first["currency"],
+            "fx": first["fx"],
+            "deposit": first["deposit"],
+            "contract_no": first["contract_no"],
+            "template": first["template"],
+            "note": first["note"],
+            "main": first["main"],
+            "spaces": members,
+        })
+
+    mains: dict[tuple, int] = {}
+    for booking in bookings:
+        if not booking["main"]:
+            continue
+        customer = customer_of(booking["spaces"][0])
+        if customer in mains:
+            row = booking["rows"][0]
+            errors.append(issue(
+                "E12",
+                f'Dòng {row}: khách "{booking["name"]}" có nhiều hơn một Đặt chỗ chính (dòng {mains[customer]})',
+                row,
+                LABELS["main"],
+            ))
+        else:
+            mains[customer] = booking["rows"][0]
+    return bookings, errors
 
 
-def is_zone(service: str, space: dict) -> bool:
-    """A space is a zone when its area is not a number. The service name is not used."""
-    return bool(space["area_dummy"])
+def read_onboarding(path: Path) -> dict:
+    """Return the as-of date, file and row errors, every room row, and the bookings."""
+    as_of = date.today()
+    result = {"asOf": as_of, "errors": [], "spaces": [], "bookings": []}
+    try:
+        workbook = openpyxl.load_workbook(path, data_only=True)
+    except Exception:
+        result["errors"] = [issue("E01", "File không đúng định dạng .xlsx")]
+        return result
+    sheet, header_row = locate_header(workbook)
+    first_column, file_errors = check_file(sheet, header_row)
+    if file_errors:
+        result["errors"] = file_errors
+        return result
+
+    every_space = []
+    spaces = []
+    errors = []
+    for number in range(header_row + 1, (sheet.max_row or header_row) + 1):
+        raw = {
+            key: sheet.cell(number, first_column + offset).value
+            for offset, (key, _label) in enumerate(COLUMNS)
+        }
+        if all(blank(value) for value in raw.values()):
+            continue
+        space, row_errors = read_row(number, raw)
+        errors.extend(row_errors)
+        every_space.append(space)
+        if not row_errors:
+            spaces.append(space)
+    errors.extend(duplicate_rooms(every_space))
+    bookings, booking_errors = group_bookings(spaces)
+    errors.extend(booking_errors)
+    errors.sort(key=lambda item: (item["row"] or 0, item["code"]))
+    result.update({"errors": errors, "spaces": spaces, "bookings": bookings})
+    return result
