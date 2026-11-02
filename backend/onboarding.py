@@ -1,9 +1,4 @@
-"""Read the onboarding template, validate it, and group booked rows into bookings.
-
-Checks run in two layers. File errors (E01-E03) stop the read. Row errors are
-collected so the user fixes the file in one pass. The as-of date is the day the
-file is read. This module does not call the API.
-"""
+"""Read and validate the onboarding Excel template."""
 
 from __future__ import annotations
 
@@ -148,10 +143,31 @@ def split_emails(value) -> list[str]:
     return [part.strip().lower() for part in parts if "@" in part]
 
 
+def is_valid_email(value: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+            r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+            (value or "").strip(),
+            flags=re.I,
+        )
+    )
+
+
 def norm_tax(value) -> str | None:
-    if blank(value):
+    if blank(value) or isinstance(value, bool):
         return None
-    return re.sub(r"\s+", "", str(value)) or None
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        if value.is_integer():
+            value = int(value)
+    if isinstance(value, int):
+        return str(value)
+    compact = re.sub(r"\s+", "", str(value).strip())
+    if re.fullmatch(r"\d+\.0+", compact):
+        compact = compact.split(".", 1)[0]
+    return compact or None
 
 
 def looks_like_company(name: str | None) -> bool:
@@ -195,12 +211,17 @@ def locate_header(workbook):
     return best[1], best[2]
 
 
-def check_file(sheet, header_row: int) -> tuple[int, list[dict]]:
-    """E02 for each template column out of place, E03 for each merged range. Returns the first column."""
-    errors = []
+def first_template_column(sheet, header_row: int) -> int:
     first_column = 1
     while first_column < HEADER_SCAN_COLUMNS and blank(sheet.cell(header_row, first_column).value):
         first_column += 1
+    return first_column
+
+
+def check_file(sheet, header_row: int) -> tuple[int, list[dict]]:
+    """E02 for each template column out of place, E03 for each merged range. Returns the first column."""
+    errors = []
+    first_column = first_template_column(sheet, header_row)
     for offset, (_key, label) in enumerate(COLUMNS):
         cell = sheet.cell(header_row, first_column + offset)
         if header_matches(cell.value, label):
@@ -327,11 +348,7 @@ def customer_of(space: dict) -> tuple[str, str | None]:
 
 
 def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Rows of one customer (name and tax code) with the same start and end date form one booking.
-
-    A booking has one location, one payment cycle and one currency, so rows
-    that differ there become separate bookings.
-    """
+    """One booking per customer, dates, building, cycle, and currency."""
     groups: dict[tuple, list[dict]] = {}
     for space in spaces:
         if not space["name"]:
@@ -396,6 +413,44 @@ def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
         else:
             mains[customer] = booking["rows"][0]
     return bookings, errors
+
+
+def build_error_report(path, issues: list[dict]) -> bytes:
+    """Copy the uploaded workbook and write a Lỗi column on each failing row."""
+    from io import BytesIO
+
+    workbook = openpyxl.load_workbook(path)
+    sheet, header_row = locate_header(workbook)
+    first_column = first_template_column(sheet, header_row)
+    error_column = first_column + len(COLUMNS)
+    header = sheet.cell(header_row, error_column)
+    if blank(header.value) or not header_matches(header.value, "Lỗi"):
+        header.value = "Lỗi"
+    by_row: dict[int, list[str]] = {}
+    extras: list[dict] = []
+    for item in issues:
+        row = item.get("row")
+        code = item.get("code") or ""
+        column = item.get("column") or ""
+        message = item.get("message") or ""
+        line = f"{code}: {message}" if not column else f"{code} ({column}): {message}"
+        if isinstance(row, int) and row > 0:
+            by_row.setdefault(row, []).append(line)
+        else:
+            extras.append(item)
+    for row, lines in by_row.items():
+        cell = sheet.cell(row, error_column)
+        previous = text(cell.value)
+        joined = "; ".join(lines)
+        cell.value = f"{previous}; {joined}" if previous else joined
+    if extras:
+        extra_sheet = workbook.create_sheet("Loi khong gan dong")
+        extra_sheet.append(["Mã lỗi", "Cột", "Thông báo"])
+        for item in extras:
+            extra_sheet.append([item.get("code") or "", item.get("column") or "", item.get("message") or ""])
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
 
 
 def read_onboarding(path: Path) -> dict:

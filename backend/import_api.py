@@ -1,40 +1,31 @@
-"""Build the PMS GraphQL mutations a sales user would call, in that order.
-
-Preview records each call and does not write the database.
-"""
+"""Onboarding Excel → PMS GraphQL mutations."""
 
 from __future__ import annotations
 
+import base64
 import re
 import unicodedata
 from calendar import monthrange
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
-from onboarding import issue, looks_like_company, read_onboarding
+from identity import IdentityError, graphql, namespace_of, refresh_tokens, service_graphql_url
+from onboarding import (
+    LABELS,
+    build_error_report,
+    is_valid_email,
+    issue,
+    looks_like_company,
+    norm_tax,
+    read_onboarding,
+)
 
-CATEGORY_NAME = "Cho thuê mặt bằng"
+PMS_ERROR = "E16"
 
-# Fallback address and coordinates for known buildings. Not a surveyed location.
-BUILDING_DUMMY = {
-    "ATHENA": {
-        "address": "Tòa ATHENA, TP. Hồ Chí Minh",
-        "city": "Hồ Chí Minh",
-        "lng": 106.7008,
-        "lat": 10.7796,
-    },
-    "ARTEMIS": {
-        "address": "Tòa ARTEMIS, quận Thanh Xuân, Hà Nội",
-        "city": "Hà Nội",
-        "lng": 105.8195,
-        "lat": 20.9987,
-    },
-    "738 VÕ VĂN KIỆT": {
-        "address": "738 Võ Văn Kiệt, TP. Hồ Chí Minh",
-        "city": "Hồ Chí Minh",
-        "lng": 106.6672,
-        "lat": 10.7554,
-    },
-}
+VN_TZ = timezone(timedelta(hours=7))
+UTC = timezone.utc
+PRICE_TYPE_PER_ROOM = "PER_ROOM"
+PACKAGE_UNIT_MONTHS = "MONTHS"
+PAYMENT_UNIT_MONTHS = "MONTHS"
 
 
 class SmartOSError(Exception):
@@ -45,21 +36,116 @@ def i18n(value: str) -> dict:
     return {"original": value, "translations": [{"lang": "vi", "content": value}]}
 
 
-def iso(day: date) -> str:
-    return f"{day.isoformat()}T00:00:00.000Z"
+def graphql_enum(value) -> str:
+    """GraphQL enum names are UPPER_SNAKE; BE stores kebab-case values."""
+    return str(value or "").strip().upper().replace("-", "_")
+
+
+def is_month_unit(value) -> bool:
+    return graphql_enum(value) == PACKAGE_UNIT_MONTHS
+
+
+def is_bank_method(value) -> bool:
+    return graphql_enum(value) == "BANK"
+
+
+def excel_fx_rate(source: dict) -> int | None:
+    """Integer USD/VND rate from Excel column Tỷ giá."""
+    raw = source.get("fx")
+    if raw is None:
+        return None
+    try:
+        rate = int(round(float(raw)))
+    except (TypeError, ValueError):
+        return None
+    if rate < 1:
+        return None
+    return rate
+
+
+def pms_issue_placement(message: str, booking: dict | None = None) -> tuple[str, str]:
+    text = str(message or "").strip()
+    lowered = text.lower()
+    if "giá quy đổi ngoại tệ" in lowered or "hasnofxpricing" in lowered.replace(" ", ""):
+        return LABELS["room"], text
+    if "tỷ giá" in lowered and ("trống" in lowered or "không hợp lệ" in lowered):
+        return LABELS["fx"], text
+    if "package" in lowered or "gói" in lowered:
+        return LABELS["room"], text
+    if "phương thức thanh toán" in lowered or "paymentmethod" in lowered.replace(" ", ""):
+        return LABELS["building"], text
+    if "email" in lowered:
+        return LABELS["email"], text
+    if "mã số thuế" in lowered or "tax" in lowered:
+        return LABELS["tax"], text
+    if "mẫu hợp đồng" in lowered or "contract template" in lowered:
+        return LABELS["template"], text
+    if "số hợp đồng" in lowered:
+        return LABELS["contract_no"], text
+    if "kỳ thanh toán" in lowered or "payment period" in lowered:
+        return LABELS["cycle"], text
+    if "tầng" in lowered:
+        return LABELS["floor"], text
+    if "tòa" in lowered or "location" in lowered:
+        return LABELS["building"], text
+    if "dịch vụ" in lowered or "service" in lowered:
+        return LABELS["service"], text
+    return LABELS["room"], text
+
+
+def usd_exchange_rates(source: dict) -> list[dict]:
+    """createBooking/createInvoices exchangeRates from Excel Tỷ giá."""
+    if source.get("currency") != "USD":
+        return []
+    rate = excel_fx_rate(source)
+    if not rate:
+        return []
+    return [{"currency": "USD", "rate": rate}]
+
+
+def _as_iso(moment: datetime) -> str:
+    utc = moment.astimezone(UTC)
+    millis = utc.microsecond // 1000
+    return utc.strftime("%Y-%m-%dT%H:%M:%S") + f".{millis:03d}Z"
+
+
+def start_of_day(day: date) -> str:
+    """Local 00:00:00.000 in Asia/Ho_Chi_Minh, as UTC."""
+    return _as_iso(datetime.combine(day, time.min, tzinfo=VN_TZ))
+
+
+def end_of_day(day: date) -> str:
+    """Local 23:59:59.999 in Asia/Ho_Chi_Minh, as UTC."""
+    return _as_iso(datetime.combine(day, time(23, 59, 59, 999000), tzinfo=VN_TZ))
 
 
 def as_day(value) -> date | None:
     if isinstance(value, datetime):
-        return value.date()
+        moment = value if value.tzinfo else value.replace(tzinfo=UTC)
+        return moment.astimezone(VN_TZ).date()
     if isinstance(value, date):
         return value
     if isinstance(value, str) and len(value) >= 10:
         try:
-            return date.fromisoformat(value[:10])
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(VN_TZ).date()
         except ValueError:
             return None
     return None
+
+
+def booking_status(value) -> str:
+    return str(value or "").replace("-", "_").lower()
+
+
+def is_canceled_booking(value) -> bool:
+    return booking_status(value) in {"canceled", "cancelled"}
+
+
+def is_completed_booking(value) -> bool:
+    return booking_status(value) == "completed"
 
 
 def search_text(value: str) -> str:
@@ -78,27 +164,48 @@ def add_months(day: date, months: int) -> date:
 
 
 def cycle_periods(start: date, end: date, step_months: int) -> list[dict]:
-    """Split a contract into billing periods from its start date.
-
-    A monthly cycle is start, start+1 month, start+2 months, and so on.
-    A period ends the day before the next one starts, and the last period
-    stops at the contract end.
-    """
+    """Billing periods anchored on the contract start day."""
     if end <= start:
         end = start + timedelta(days=1)
     step = max(1, step_months)
     periods = []
+    index = 0
     cursor = start
     guard = 0
     while cursor <= end and guard < 600:
         guard += 1
-        period_end = min(add_months(cursor, step) - timedelta(days=1), end)
-        periods.append({"start": cursor, "end": period_end, "months": step if period_end == add_months(cursor, step) - timedelta(days=1) else _covered_months(cursor, period_end)})
-        nxt = period_end + timedelta(days=1)
-        if nxt <= cursor:
+        next_start = add_months(start, (index + 1) * step)
+        full_end = next_start - timedelta(days=1)
+        period_end = min(full_end, end)
+        if period_end < cursor:
             break
-        cursor = nxt
+        periods.append({
+            "start": cursor,
+            "end": period_end,
+            "months": step if period_end == full_end else _covered_months(cursor, period_end),
+        })
+        cursor = period_end + timedelta(days=1)
+        if cursor < next_start:
+            cursor = next_start
+        if cursor <= periods[-1]["start"]:
+            break
+        index += 1
     return periods
+
+
+def elapsed_pms_periods(stored: list, booking_start: date, booking_end: date, as_of: date) -> list[tuple[dict, dict]]:
+    """Payment periods PMS already created that ended before the import date."""
+    rows = []
+    for item in stored:
+        start = as_day(item.get("startDate"))
+        end = as_day(item.get("endDate"))
+        if not start or not end or end >= as_of:
+            continue
+        if end < booking_start or start > booking_end:
+            continue
+        rows.append(({"start": start, "end": end, "months": _covered_months(start, end)}, item))
+    rows.sort(key=lambda row: row[0]["start"])
+    return rows
 
 
 def _covered_months(start: date, end: date) -> int:
@@ -117,23 +224,8 @@ def span_months(start: date, end: date) -> int:
     return months
 
 
-def working_day() -> dict:
-    opened = {"isOpened": True, "open": 8, "close": 18}
-    closed = {"isOpened": False, "open": 8, "close": 18}
-    return {
-        "isDifferent": False,
-        "monday": opened,
-        "tuesday": opened,
-        "wednesday": opened,
-        "thursday": opened,
-        "friday": opened,
-        "saturday": closed,
-        "sunday": closed,
-    }
-
-
 class Importer:
-    def __init__(self, client: SmartOS, urls: dict, options: dict):
+    def __init__(self, client, urls: dict, options: dict):
         self.client = client
         self.urls = urls
         self.options = options
@@ -144,156 +236,247 @@ class Importer:
         self.floors: dict[tuple[str, str], str] = {}
         self.rooms: dict[tuple[str, str], dict] = {}
         self.customers: dict[str, str] = {}
-        self.extra_service_types: dict[str, str] = {}
         self.transfer_methods: dict[str, str] = {}
         self.contract_templates: dict[str, str] = {}
+        self.booked_rooms: set[tuple[str, str]] = set()
 
     def step(self, action: str, name: str, status: str, record_id: str = "", detail: str = ""):
         self.steps.append(
             {"action": action, "name": name, "status": status, "id": record_id, "detail": detail}
         )
 
+    def record_issue(
+        self,
+        message: str,
+        row: int | None = None,
+        column: str | None = None,
+        action: str = "error",
+        name: str = "",
+        code: str = PMS_ERROR,
+    ):
+        self.issues.append(issue(code, message, row, column))
+        self.step(action, name or (f"dòng {row}" if row else "lỗi"), "error", detail=message)
+
+    def record_booking_issue(self, booking: dict, error, action: str = "booking"):
+        column, detail = pms_issue_placement(str(error), booking)
+        name = booking.get("name") or ""
+        spaces = booking.get("spaces") or []
+        if column == LABELS["room"] and spaces:
+            for space in spaces:
+                self.record_issue(detail, space["row"], column, action, f"{name} / {space['room']}")
+            return
+        for row in booking.get("rows") or [None]:
+            self.record_issue(detail, row, column, action, name)
+
+    def summary(self) -> dict:
+        created: dict[str, int] = {}
+        reused: dict[str, int] = {}
+        for item in self.steps:
+            if item["status"] == "created":
+                created[item["action"]] = created.get(item["action"], 0) + 1
+            elif item["status"] == "reused":
+                reused[item["action"]] = reused.get(item["action"], 0) + 1
+        return {
+            "created": created,
+            "reused": reused,
+            "vacantRooms": sum(1 for key in self.rooms if key not in self.booked_rooms),
+        }
+
+    def mark_booked(self, booking: dict):
+        building = booking["building"]
+        for space in booking["spaces"]:
+            key = (building, space["room"])
+            if key in self.rooms:
+                self.booked_rooms.add(key)
+
     def run(self, as_of: date, spaces: list[dict], bookings: list[dict]) -> dict:
-        try:
-            category_id = self.ensure_category()
-            for name, geo in self.collect_buildings(spaces).items():
-                self.ensure_location(name, geo)
-            self.ensure_services(category_id, spaces)
-            self.ensure_floors_and_rooms(spaces)
-            self.ensure_extra_services(bookings)
-            # SmartOS marks a customer's first open booking as the main booking.
-            for booking in sorted(bookings, key=lambda item: not item["main"]):
+        self.resolve_catalog(spaces)
+        self.ensure_floors_and_rooms(spaces)
+        for booking in sorted(bookings, key=lambda item: not item["main"]):
+            try:
+                if self.skip_invalid_email(booking):
+                    continue
+                if booking["building"] not in self.locations:
+                    self.step(
+                        "booking",
+                        booking["name"],
+                        "skipped",
+                        detail=f'Tòa "{booking["building"]}" chưa có trên hệ thống',
+                    )
+                    continue
                 self.ensure_customer(booking)
                 self.ensure_booking(as_of, booking)
-        except SmartOSError as caught:
-            self.step("error", "dừng", "error", detail=str(caught))
-            return {"steps": self.steps, "error": str(caught)}
+            except SmartOSError as caught:
+                self.record_booking_issue(booking, caught)
+            except Exception as caught:
+                self.record_booking_issue(booking, caught)
+        self.issues.sort(key=lambda item: (item.get("row") is None, item.get("row") or 0, item.get("code") or ""))
         return {"steps": self.steps, "error": ""}
 
-    def collect_buildings(self, spaces: list[dict]) -> dict:
-        found = {}
-        for space in spaces:
-            name = space["building"]
-            found.setdefault(name, BUILDING_DUMMY.get(name, {
-                "address": f"{name}, Việt Nam",
-                "city": "Hồ Chí Minh",
-                "lng": 106.7,
-                "lat": 10.77,
-            }))
-        return found
+    def resolve_catalog(self, spaces: list[dict]):
+        for name in dict.fromkeys(space["building"] for space in spaces):
+            try:
+                self.ensure_location(name)
+            except SmartOSError as caught:
+                row = next((space["row"] for space in spaces if space["building"] == name), None)
+                self.record_issue(str(caught), row, "Toà nhà", "location", name)
+            except Exception as caught:
+                row = next((space["row"] for space in spaces if space["building"] == name), None)
+                self.record_issue(str(caught), row, "Toà nhà", "location", name)
+        for name in dict.fromkeys(space["service"] for space in spaces):
+            try:
+                self.ensure_service(name)
+            except SmartOSError as caught:
+                row = next((space["row"] for space in spaces if space["service"] == name), None)
+                self.record_issue(str(caught), row, "Dịch vụ cung cấp", "service", name)
+            except Exception as caught:
+                row = next((space["row"] for space in spaces if space["service"] == name), None)
+                self.record_issue(str(caught), row, "Dịch vụ cung cấp", "service", name)
 
-    def ensure_category(self) -> str:
-        given = (self.options.get("categoryId") or "").strip()
-        if given:
-            self.step("serviceCategory", CATEGORY_NAME, "reused", given, "Dùng categoryId đã có")
-            return given
-        found = self.client.items(
-            self.urls["property"],
-            "serviceCategories",
-            "ServiceCategoryQueryInput",
-            "id name { original }",
-            {"name": {"original": {"eq": CATEGORY_NAME}}},
-        )
-        match = next((item for item in found if item["name"]["original"] == CATEGORY_NAME), None)
-        if match:
-            self.step("serviceCategory", CATEGORY_NAME, "reused", match["id"])
-            return match["id"]
-        icon = (self.options.get("categoryIcon") or "").strip()
-        if not icon:
-            raise SmartOSError("Thiếu categoryIcon (file key) hoặc categoryId của category đã có")
-        created = self.client.mutate(
-            self.urls["property"],
-            "createServiceCategory",
-            "CreateServiceCategoryCommandInput",
-            "id",
-            {
-                "name": i18n(CATEGORY_NAME),
-                "icon": icon,
-                "priority": 1,
-                "color": (self.options.get("categoryColor") or "#1C1917").strip(),
-            },
-        )
-        self.step("serviceCategory", CATEGORY_NAME, "created", created["id"])
-        return created["id"]
-
-    def ensure_location(self, name: str, geo: dict):
+    def ensure_location(self, name: str):
+        folded = search_text(name)
         found = self.client.items(
             self.urls["property"],
             "locations",
             "LocationQueryInput",
-            "id name",
-            {"name": {"eq": name}},
+            "id name searchText",
+            {},
         )
-        match = next((item for item in found if item["name"] == name), None)
-        if match:
-            self.locations[name] = match["id"]
-            self.step("location", name, "reused", match["id"])
-            return
-        created = self.client.mutate(
-            self.urls["property"],
-            "createLocation",
-            "CreateLocationCommandInput",
-            "id",
-            {
-                "name": name,
-                "address": {"text": geo["address"], "city": geo["city"], "country": "VN"},
-                "geoLocation": {"coordinates": [geo["lng"], geo["lat"]]},
-                "workingDay": working_day(),
-                "serviceIds": [],
-                "representativeId": self.options["representativeId"].strip(),
-            },
+        match = next(
+            (
+                item for item in found
+                if item.get("name") == name or item.get("searchText") == folded
+            ),
+            None,
         )
-        self.locations[name] = created["id"]
-        self.step("location", name, "created", created["id"])
+        if not match:
+            raise SmartOSError(
+                f'Tòa nhà "{name}" chưa có trên hệ thống. Tạo location trước khi import phòng.'
+            )
+        self.locations[name] = match["id"]
+        self.step("location", name, "reused", match["id"])
 
-    def ensure_services(self, category_id: str, spaces: list[dict]):
-        by_name: dict[str, set[str]] = {}
-        for space in spaces:
-            by_name.setdefault(space["service"], set()).add(self.locations[space["building"]])
-        for name, location_ids in by_name.items():
-            folded = search_text(name)
-            found = self.client.items(
-                self.urls["property"],
-                "services",
-                "ServiceQueryInput",
-                "id name { original } searchText",
-                {"searchText": {"eq": folded}},
-            )
-            match = next(
-                (
-                    item for item in found
-                    if item.get("searchText") == folded or (item.get("name") or {}).get("original") == name
-                ),
-                None,
-            )
-            if match:
-                self.services[name] = match["id"]
-                self.step("service", name, "reused", match["id"])
+    def ensure_service(self, name: str):
+        folded = search_text(name)
+        found = self._list_services(folded)
+        match = next((item for item in found if _service_matches(item, name, folded)), None)
+        if not match:
+            raise SmartOSError(_service_missing_message(name, found))
+        self.services[name] = match["id"]
+        self.step("service", name, "reused", match["id"])
+
+    def _list_services(self, folded: str) -> list[dict]:
+        found: list[dict] = []
+        seen: set[str] = set()
+
+        def add(rows):
+            for item in rows or []:
+                sid = str(item.get("id") or "")
+                if sid and sid in seen:
+                    continue
+                if sid:
+                    seen.add(sid)
+                found.append(item)
+
+        for filt in ({}, {"searchText": {"like": f"%{folded}%"}}):
+            try:
+                add(self._query_services(filt))
+            except SmartOSError:
                 continue
-            created = self.client.mutate(
-                self.urls["property"],
-                "createService",
-                "CreateServiceCommandInput",
-                "id",
-                {
-                    "name": i18n(name),
-                    "isActive": True,
-                    "isPublic": True,
-                    "categoryId": category_id,
-                    "locationIds": sorted(location_ids),
-                },
-            )
-            self.services[name] = created["id"]
-            self.step("service", name, "created", created["id"])
+        add(self._services_on_locations())
+        return found
+
+    def _query_services(self, filt: dict) -> list:
+        last_error = None
+        for selection in (
+            "id name { original translations { lang content } } searchText locationIds isActive",
+            "id name { original } searchText",
+            "id name searchText",
+        ):
+            try:
+                return self.client.items(
+                    self.urls["property"],
+                    "services",
+                    "ServiceQueryInput",
+                    selection,
+                    filt,
+                )
+            except SmartOSError as error:
+                last_error = error
+        if last_error:
+            raise last_error
+        return []
+
+    def _services_on_locations(self) -> list[dict]:
+        graphql = getattr(self.client, "graphql", None)
+        if not callable(graphql):
+            return []
+        rows = []
+        query = """
+        query($id: ObjectID!) {
+          location(id: $id) {
+            services {
+              id
+              name { original translations { lang content } }
+              searchText
+            }
+          }
+        }
+        """
+        simple = """
+        query($id: ObjectID!) {
+          location(id: $id) {
+            services { id name { original } searchText }
+          }
+        }
+        """
+        for loc_id in self.locations.values():
+            data = None
+            for body in (query, simple):
+                try:
+                    data = graphql(self.urls["property"], body, {"id": loc_id})
+                    break
+                except SmartOSError:
+                    continue
+            rows.extend(((data or {}).get("location") or {}).get("services") or [])
+        return rows
 
     def ensure_floors_and_rooms(self, spaces: list[dict]):
         grouped: dict[tuple[str, str], list[dict]] = {}
         for space in spaces:
             grouped.setdefault((space["building"], space["floor"]), []).append(space)
         for (building, floor_name), members in grouped.items():
-            floor_id = self.ensure_floor(building, floor_name)
+            if building not in self.locations:
+                continue
+            try:
+                floor_id = self.ensure_floor(building, floor_name)
+            except SmartOSError as caught:
+                self.record_issue(str(caught), members[0]["row"], "Tầng", "floor", f"{building} / {floor_name}")
+                continue
+            except Exception as caught:
+                self.record_issue(str(caught), members[0]["row"], "Tầng", "floor", f"{building} / {floor_name}")
+                continue
             for space in members:
-                self.ensure_room(building, floor_id, space)
+                if space["service"] not in self.services:
+                    continue
+                try:
+                    self.ensure_room(building, floor_id, space)
+                except SmartOSError as caught:
+                    self.record_issue(
+                        str(caught),
+                        space["row"],
+                        "Khu vực/phòng",
+                        "room",
+                        f"{building} / {space['room']}",
+                    )
+                except Exception as caught:
+                    self.record_issue(
+                        str(caught),
+                        space["row"],
+                        "Khu vực/phòng",
+                        "room",
+                        f"{building} / {space['room']}",
+                    )
 
     def ensure_floor(self, building: str, floor_name: str) -> str:
         key = (building, floor_name)
@@ -308,29 +491,16 @@ class Importer:
             {"locationId": {"eq": location_id}},
         )
         match = next((item for item in found if item["name"]["original"] == floor_name), None)
-        if match:
-            self.floors[key] = match["id"]
-            self.step("floor", f"{building} / {floor_name}", "reused", match["id"])
-            return match["id"]
-        created = self.client.mutate(
-            self.urls["property"],
-            "createFloor",
-            "CreateFloorCommandInput",
-            "id",
-            {
-                "name": i18n(floor_name),
-                "locationId": location_id,
-                "rentalTypes": ["room"],
-            },
-        )
-        self.floors[key] = created["id"]
-        self.step("floor", f"{building} / {floor_name}", "created", created["id"])
-        return created["id"]
+        if not match:
+            raise SmartOSError(
+                f'Tầng "{floor_name}" của tòa "{building}" chưa có trên hệ thống. Tạo floor trước khi import phòng.'
+            )
+        self.floors[key] = match["id"]
+        self.step("floor", f"{building} / {floor_name}", "reused", match["id"])
+        return match["id"]
 
     def ensure_room(self, building: str, floor_id: str, space: dict):
-        """One template row is one room with one monthly package."""
         service = space["service"]
-        amount = space["rent"]
         found = self.client.items(
             self.urls["property"],
             "rooms",
@@ -343,7 +513,7 @@ class Importer:
             room = {"id": match["id"], "packages": match.get("packages") or [], "reused": True}
             self.rooms[(building, space["room"])] = room
             self.step("room", f"{building} / {space['room']}", "reused", match["id"])
-            self.attach_package(room, service, "per-room", amount, space["room"])
+            self.attach_package(room, space)
             return
         created = self.client.mutate(
             self.urls["property"],
@@ -353,101 +523,90 @@ class Importer:
             {
                 "name": i18n(space["room"]),
                 "area": space["area"],
-                "isZone": False,
                 "floorId": floor_id,
                 "locationId": self.locations[building],
                 "capacity": max(1, round(space["area"] / 10)),
                 "tier": "Standard",
                 "packages": [{
-                    "priceType": "per-room",
-                    "unit": "months",
-                    "amount": amount,
+                    "priceType": PRICE_TYPE_PER_ROOM,
+                    "unit": PACKAGE_UNIT_MONTHS,
+                    "amount": self.base_package_amount(space),
                     "serviceId": self.services[service],
                 }],
             },
         )
-        self.rooms[(building, space["room"])] = {"id": created["id"], "packages": created.get("packages") or []}
+        room = {"id": created["id"], "packages": created.get("packages") or []}
+        self.rooms[(building, space["room"])] = room
         self.step("room", f"{building} / {space['room']}", "created", created["id"])
+        self.step("package", f"{space['room']} / {service}", "created")
+        self.attach_package(room, space)
 
-    def attach_package(self, room: dict, service: str, price_type: str, amount: float, room_name: str):
+    def base_package_amount(self, space: dict) -> float:
+        rent = space["rent"]
+        rate = excel_fx_rate(space)
+        if space.get("currency") == "USD" and rate:
+            return round(float(rent) * rate)
+        return rent
+
+    def usd_alternative_amounts(self, space: dict) -> list[dict]:
+        if space.get("currency") != "USD":
+            return []
+        return [{"currency": "USD", "amount": space["rent"], "isAutoCalculated": False}]
+
+    def package_input(self, item: dict, space: dict | None = None) -> dict:
+        payload = {
+            "priceType": graphql_enum(item.get("priceType") or PRICE_TYPE_PER_ROOM),
+            "unit": graphql_enum(item.get("unit") or PACKAGE_UNIT_MONTHS),
+            "amount": item["amount"],
+            "serviceId": item["serviceId"],
+        }
+        alternatives = self.usd_alternative_amounts(space) if space else []
+        if alternatives:
+            payload["alternativeAmounts"] = alternatives
+        return payload
+
+    def attach_package(self, room: dict, space: dict):
+        service = space["service"]
         service_id = self.services[service]
-        for package in room["packages"]:
-            if package.get("serviceId") == service_id and package.get("unit") == "months":
-                return
-        kept = [
-            {
-                "priceType": item["priceType"],
-                "unit": item["unit"],
-                "amount": item["amount"],
-                "serviceId": item["serviceId"],
-            }
-            for item in room["packages"]
-        ]
-        kept.append({
-            "priceType": price_type,
-            "unit": "months",
-            "amount": amount,
+        existing = next(
+            (
+                item
+                for item in room["packages"]
+                if item.get("serviceId") == service_id and is_month_unit(item.get("unit"))
+            ),
+            None,
+        )
+        if existing:
+            if space.get("currency") == "USD":
+                self.stamp_usd_pricing(room, space)
+            return
+        kept = [self.package_input(item) for item in room["packages"]]
+        kept.append(self.package_input({
+            "priceType": PRICE_TYPE_PER_ROOM,
+            "unit": PACKAGE_UNIT_MONTHS,
+            "amount": self.base_package_amount(space),
             "serviceId": service_id,
-        })
+        }, space))
+        self.write_packages(room, kept)
+        self.step("package", f"{space['room']} / {service}", "created")
+
+    def stamp_usd_pricing(self, room: dict, space: dict):
+        service_id = self.services[space["service"]]
+        kept = []
+        for item in room["packages"]:
+            match = item.get("serviceId") == service_id and is_month_unit(item.get("unit"))
+            kept.append(self.package_input(item, space if match else None))
+        self.write_packages(room, kept)
+
+    def write_packages(self, room: dict, packages: list[dict]):
         updated = self.client.mutate(
             self.urls["property"],
             "mutatePackages",
             "MutatePackagesCommandInput",
             "id serviceId unit amount priceType",
-            {"roomId": room["id"], "packages": kept},
+            {"roomId": room["id"], "packages": packages},
         )
         room["packages"] = updated if isinstance(updated, list) else [updated]
-        self.step("package", f"{room_name} / {service}", "created")
-
-    def ensure_extra_services(self, bookings: list[dict]):
-        category_id = (self.options.get("extraServiceCategoryId") or "").strip()
-        unit_id = (self.options.get("unitId") or "").strip()
-        if not category_id or not unit_id:
-            self.step(
-                "extraServiceType",
-                "Phí dịch vụ",
-                "skipped",
-                detail="Thiếu extraServiceCategoryId hoặc unitId, bỏ qua phí dịch vụ",
-            )
-            return
-        if not any(space["fee"] > 0 for booking in bookings for space in booking["spaces"]):
-            self.step("extraServiceType", "Phí dịch vụ", "skipped", detail="Không booking nào có phí dịch vụ")
-            return
-        seen = set()
-        for booking in bookings:
-            building = booking["building"]
-            if building in seen:
-                continue
-            seen.add(building)
-            location_id = self.locations[building]
-            found = self.client.items(
-                self.urls["reservation"],
-                "extraServiceTypes",
-                "ExtraServiceTypeQueryInput",
-                "id name { original }",
-                {"locationId": {"eq": location_id}},
-            )
-            match = next((item for item in found if item["name"]["original"] == "Phí dịch vụ"), None)
-            if match:
-                self.extra_service_types[building] = match["id"]
-                self.step("extraServiceType", f"{building} / Phí dịch vụ", "reused", match["id"])
-                continue
-            created = self.client.mutate(
-                self.urls["reservation"],
-                "createExtraServiceType",
-                "CreateExtraServiceTypeCommandInput",
-                "id",
-                {
-                    "name": i18n("Phí dịch vụ"),
-                    "price": 0,
-                    "unit": i18n("tháng"),
-                    "unitId": unit_id,
-                    "extraServiceCategoryId": category_id,
-                    "locationId": location_id,
-                },
-            )
-            self.extra_service_types[building] = created["id"]
-            self.step("extraServiceType", f"{building} / Phí dịch vụ", "created", created["id"])
 
     def customer_key(self, booking: dict) -> str:
         name = booking["name"]
@@ -455,6 +614,16 @@ class Importer:
             return f"tax:{booking['tax']}"
         kind = "company" if looks_like_company(name) else "name"
         return f"{kind}:{name}"
+
+    def skip_invalid_email(self, booking: dict) -> bool:
+        invalid = [email for email in booking["emails"] if not is_valid_email(email)]
+        if not invalid:
+            return False
+        name = booking["name"]
+        shown = ", ".join(invalid)
+        self.step("customer", name, "skipped", detail=f"Email không hợp lệ: {shown}")
+        self.step("booking", name, "skipped", detail="Bỏ qua vì email không hợp lệ")
+        return True
 
     def ensure_customer(self, booking: dict):
         name = booking["name"]
@@ -464,92 +633,110 @@ class Importer:
         if key in self.customers:
             return
         emails = list(booking["emails"]) or [f"{name.lower().replace(' ', '.')}@onboarding.invalid"]
-        if tax:
-            found = self.client.items(
-                self.urls["customer"],
-                "customers",
-                "CustomerQueryInput",
-                "id taxCode",
-                {"taxCode": {"eq": tax}},
-            )
-            match = next((item for item in found if item.get("taxCode") == tax), None)
-        else:
-            found = self.client.items(
-                self.urls["customer"],
-                "customers",
-                "CustomerQueryInput",
-                "id email",
-                {"email": {"eq": emails[0].lower()}},
-            )
-            match = next((item for item in found if (item.get("email") or "").lower() == emails[0].lower()), None)
+        match = self.find_customer(tax=tax, email=None if tax else emails[0])
         if match:
             self.customers[key] = match["id"]
             self.step("customer", name, "reused", match["id"])
             return
         building = booking["building"]
-        if company:
-            members = [
-                {"contactName": email.split("@", 1)[0], "email": email}
-                for email in emails[1:]
-            ]
-            payload = {
-                "companyName": {"vi": name},
-                "email": emails[0],
-                "legalRepName": name,
-                "legalRepRole": "Người đại diện",
-                "members": members,
-                "locationId": self.locations[building],
-            }
-            if tax:
-                payload["taxCode"] = tax
-            created = self.client.mutate(
-                self.urls["customer"],
-                "createCompany",
-                "CreateCompanyCommandInput",
-                "id",
-                payload,
-            )
-        else:
-            created = self.client.mutate(
-                self.urls["customer"],
-                "createIndividual",
-                "CreateIndividualCommandInput",
-                "id",
-                {
-                    "contactName": name,
+        try:
+            if company:
+                members = [
+                    {"contactName": email.split("@", 1)[0], "email": email}
+                    for email in emails[1:]
+                ]
+                payload = {
+                    "companyName": {"vi": name},
                     "email": emails[0],
+                    "legalRepName": name,
+                    "legalRepRole": "Người đại diện",
+                    "members": members,
                     "locationId": self.locations[building],
-                },
-            )
+                }
+                if tax:
+                    payload["taxCode"] = tax
+                created = self.client.mutate(
+                    self.urls["customer"],
+                    "createCompany",
+                    "CreateCompanyCommandInput",
+                    "id",
+                    payload,
+                )
+            else:
+                created = self.client.mutate(
+                    self.urls["customer"],
+                    "createIndividual",
+                    "CreateIndividualCommandInput",
+                    "id",
+                    {
+                        "contactName": name,
+                        "email": emails[0],
+                        "locationId": self.locations[building],
+                    },
+                )
+        except SmartOSError as error:
+            recovered = self.find_customer_after_conflict(str(error), tax, emails[0])
+            if not recovered:
+                raise
+            self.customers[key] = recovered["id"]
+            self.step("customer", name, "reused", recovered["id"], str(error))
+            return
         self.customers[key] = created["id"]
         self.step("customer", name, "created", created["id"])
 
-    def find_bookings(self, booking: dict, ready: list) -> list:
-        """The booking SmartOS already has for this customer, location, room set and exact times.
+    def find_customer(self, tax: str | None = None, email: str | None = None):
+        needles = []
+        if tax:
+            needles.extend([tax, search_text(tax)])
+        if email:
+            needles.extend([email, search_text(email)])
+        filters = [{"searchText": {"like": needle}} for needle in needles if needle]
+        filters.append({})
+        for filt in filters:
+            try:
+                found = self.client.items(
+                    self.urls["customer"],
+                    "customers",
+                    "CustomerQueryInput",
+                    "id taxCode email searchText",
+                    filt,
+                )
+            except SmartOSError:
+                continue
+            for item in found:
+                if tax and norm_tax(item.get("taxCode")) == norm_tax(tax):
+                    return item
+                if not tax and email and (item.get("email") or "").lower() == email.lower():
+                    return item
+        return None
 
-        `roomIds.in` is an intersection, so the room set is compared again here.
-        Canceled bookings are ignored.
-        """
+    def find_customer_after_conflict(self, message: str, tax: str | None, email: str):
+        lowered = message.lower()
+        if tax and ("mã số thuế" in lowered or "tax code" in lowered or "taxcode" in lowered):
+            return self.find_customer(tax=tax)
+        if "email" in lowered and (
+            "đã tồn tại" in lowered or "already exists" in lowered or "conflict" in lowered
+        ):
+            return self.find_customer(email=email)
+        return None
+
+    def find_bookings(self, booking: dict, ready: list) -> list:
         start, end = booking["start"], booking["end"]
         room_ids = [room["id"] for _space, room in ready]
         found = self.client.items(
             self.urls["reservation"],
             "bookings",
             "BookingQueryInput",
-            "id code status startTime endTime roomIds roomServices { extraServiceTypeId }",
+            "id code status startTime endTime roomIds",
             {
                 "locationId": {"eq": self.locations[booking["building"]]},
                 "primaryCustomerId": {"eq": self.customers[self.customer_key(booking)]},
-                "startTime": {"eq": iso(start)},
-                "endTime": {"eq": iso(end)},
-                "status": {"ne": "canceled"},
-                "roomIds": {"in": room_ids},
             },
         )
         wanted = set(room_ids)
         matches = []
         for item in found:
-            if item.get("status") == "canceled":
+            if is_canceled_booking(item.get("status")):
                 continue
             if as_day(item.get("startTime")) != start or as_day(item.get("endTime")) != end:
                 continue
@@ -558,36 +745,30 @@ class Importer:
         return matches
 
     def overlapping_booking(self, booking: dict, ready: list) -> dict | None:
-        """E13: an existing room already has a booking that overlaps this one.
-
-        Same window as getBookingsForFloorPlan: startTime < end and endTime > start.
-        A booking that only touches the boundary is not an overlap.
-        """
         reused = [(space, room) for space, room in ready if room.get("reused")]
         if not reused:
             return None
         start, end = booking["start"], booking["end"]
-        by_id = {room["id"]: space for space, room in reused}
+        by_id = {str(room["id"]): space for space, room in reused}
         found = self.client.items(
             self.urls["reservation"],
             "bookings",
             "BookingQueryInput",
             "id code status startTime endTime roomIds",
             {
-                "roomIds": {"in": list(by_id)},
-                "startTime": {"lt": iso(end)},
-                "endTime": {"gt": iso(start)},
-                "status": {"ne": "canceled"},
+                "locationId": {"eq": self.locations[reused[0][0]["building"]]},
             },
         )
         for item in found:
-            if item.get("status") == "canceled":
+            if is_canceled_booking(item.get("status")):
                 continue
             item_start, item_end = as_day(item.get("startTime")), as_day(item.get("endTime"))
             if item_start is None or item_end is None or not (item_start < end and item_end > start):
                 continue
             overlap = {str(room_id) for room_id in item.get("roomIds") or []} & set(by_id)
-            space = by_id[next(iter(overlap))] if overlap else reused[0][0]
+            if not overlap:
+                continue
+            space = by_id[next(iter(overlap))]
             return issue(
                 "E13",
                 f'Dòng {space["row"]}: phòng "{space["room"]}" đã có booking trùng thời gian '
@@ -624,21 +805,34 @@ class Importer:
         if existing:
             self.step("booking", name, "reused", existing["id"])
             booking_id = existing["id"]
-            self.apply_service_fee(booking_id, building, ready, name, existing)
         else:
             clash = self.overlapping_booking(booking, ready)
             if clash:
                 self.issues.append(clash)
                 self.step("booking", name, "skipped", detail=clash["message"])
                 return
-            booking_id = self.create_booking(booking, ready, name)
-        self.ensure_contract_record(booking, booking_id, name)
-        self.invoice_elapsed_periods(as_of, booking, booking_id, name, reused=existing is not None)
+            try:
+                booking_id = self.create_booking(booking, ready, name)
+            except (SmartOSError, Exception) as caught:
+                self.record_booking_issue(booking, caught)
+                return
+        self.mark_booked(booking)
+        try:
+            self.ensure_contract_record(booking, booking_id, name)
+        except (SmartOSError, Exception) as caught:
+            self.record_booking_issue(booking, caught, "contract")
+        try:
+            self.invoice_elapsed_periods(as_of, booking, booking_id, name, reused=existing is not None)
+        except (SmartOSError, Exception) as caught:
+            self.record_booking_issue(booking, caught, "invoice")
         if booking["end"] < as_of:
-            if existing and existing.get("status") == "completed":
-                self.step("completeBooking", name, "reused", booking_id)
-            else:
-                self.complete_booking(booking_id, name)
+            try:
+                if existing and is_completed_booking(existing.get("status")):
+                    self.step("completeBooking", name, "reused", booking_id)
+                else:
+                    self.complete_booking(booking_id, name)
+            except (SmartOSError, Exception) as caught:
+                self.record_booking_issue(booking, caught, "completeBooking")
 
     def create_booking(self, booking: dict, ready: list, name: str) -> str:
         building = booking["building"]
@@ -649,56 +843,65 @@ class Importer:
             package = next(
                 (
                     item for item in room["packages"]
-                    if item.get("serviceId") == service_id and item.get("unit") == "months"
+                    if item.get("serviceId") == service_id and is_month_unit(item.get("unit"))
                 ),
                 None,
             )
             if package is None:
                 raise SmartOSError(f"Phòng {space['room']} chưa có package tháng cho {service}")
             entry = rooms.setdefault(room["id"], {"id": room["id"], "packages": []})
-            entry["packages"].append({"id": package["id"], "amount": space["rent"]})
-        deposit = booking["deposit"]
+            entry["packages"].append({"id": package["id"], "amount": float(space["rent"] or 0)})
+        deposit = float(booking["deposit"] or 0)
         mode, duration = booking["cycle"]
         start = booking["start"]
         end = booking["end"]
         duration = span_months(start, end) if mode == "full" else duration
         first_end = min(add_months(start, duration) - timedelta(days=1), end)
         customer_id = self.customers[self.customer_key(booking)]
+        foreign = booking.get("currency") == "USD"
         payload = {
             "locationId": self.locations[building],
             "rooms": list(rooms.values()),
             "customerIds": [customer_id],
             "primaryCustomerId": customer_id,
-            "startTime": iso(start),
-            "endTime": iso(end),
+            "startTime": start_of_day(start),
+            "endTime": end_of_day(end),
             "selectTime": False,
             "monthlyCalculationType": "Cycle",
             "daysOfMonthCalculationType": "DaysOfCalendar",
             "numberOfPeople": 1,
             "applyTax": False,
-            "currency": booking["currency"],
+            "currency": "USD" if foreign else "VND",
             "markAsConfirmed": True,
             "paymentSettings": {
-                "unit": "months",
+                "unit": PAYMENT_UNIT_MONTHS,
                 "duration": duration,
-                "firstPeriodPaymentStartDate": iso(start),
-                "firstPeriodPaymentEndDate": iso(first_end),
+                "firstPeriodPaymentStartDate": start_of_day(start),
+                "firstPeriodPaymentEndDate": end_of_day(first_end),
             },
         }
         if booking["note"]:
             payload["note"] = booking["note"]
-        if booking["currency"] == "USD":
-            payload["exchangeRates"] = [{"currency": "USD", "rate": round(booking["fx"])}]
+        if foreign:
+            rates = usd_exchange_rates(booking)
+            if not rates:
+                raise SmartOSError(
+                    f'Dòng {booking["rows"][0]}: tiền tệ USD nhưng cột "Tỷ giá" trống hoặc không hợp lệ'
+                )
+            payload["exchangeRates"] = rates
         if deposit > 0:
-            deposit_input = {
+            method = self.transfer_method_id(self.locations[building])
+            if not method:
+                raise SmartOSError(
+                    f'Tòa "{building}" chưa có phương thức thanh toán Transfer (bank) '
+                    "để ghi nhận tiền cọc đã thu"
+                )
+            payload["deposit"] = {
                 "requiredAmount": deposit,
                 "paidAmount": deposit,
-                "transactionDate": iso(start),
+                "transactionDate": start_of_day(start),
+                "paymentMethodId": method,
             }
-            method = self.transfer_method_id(self.locations[building])
-            if method:
-                deposit_input["paymentMethodId"] = method
-            payload["deposit"] = deposit_input
         created = self.client.mutate(
             self.urls["reservation"],
             "createBooking",
@@ -707,43 +910,9 @@ class Importer:
             payload,
         )
         self.step("booking", name, "created", created["id"], created.get("code", ""))
-        self.apply_service_fee(created["id"], building, ready, name)
         return created["id"]
 
-    def apply_service_fee(self, booking_id: str, building: str, ready: list, name: str, existing: dict | None = None):
-        """Write the contract fee onto booking.roomServices. The catalog price stays 0.
-
-        A booking that already has room services is left alone, so a rerun does not
-        overwrite a fee changed in PMS.
-        """
-        if existing and existing.get("roomServices"):
-            self.step("serviceFee", name, "reused", booking_id)
-            return
-        type_id = self.extra_service_types.get(building)
-        monthly_fee = sum((space.get("fee") or 0) for space, _room in ready)
-        if not type_id or monthly_fee <= 0:
-            return
-        self.client.mutate(
-            self.urls["reservation"],
-            "updateBookingRoomServices",
-            "UpdateBookingRoomServicesCommandInput",
-            "success",
-            {
-                "id": booking_id,
-                "roomServices": [{
-                    "extraServiceTypeId": type_id,
-                    "type": "EXTRA_SERVICE",
-                    "price": monthly_fee,
-                    "name": i18n("Phí dịch vụ"),
-                    "unit": i18n("tháng"),
-                    "quantity": 1,
-                }],
-            },
-        )
-        self.step("serviceFee", name, "created", booking_id, str(monthly_fee))
-
     def transfer_method_id(self, location_id: str) -> str:
-        """Default payment method is Transfer, stored as PaymentMethodType bank."""
         explicit = (self.options.get("paymentMethodId") or "").strip()
         if explicit:
             return explicit
@@ -757,7 +926,7 @@ class Importer:
             "id type",
             {"locationId": {"eq": location_id}, "type": {"eq": "bank"}},
         )
-        match = next((item for item in found if item.get("type") == "bank"), None)
+        match = next((item for item in found if is_bank_method(item.get("type"))), None)
         if not match:
             return ""
         self.transfer_methods[location_id] = match["id"]
@@ -827,10 +996,10 @@ class Importer:
             {
                 "code": number,
                 "name": template_name,
-                "effectiveDate": iso(start),
-                "expiryDate": iso(end),
-                "bookingStartTime": iso(start),
-                "bookingEndTime": iso(end),
+                "effectiveDate": start_of_day(start),
+                "expiryDate": end_of_day(end),
+                "bookingStartTime": start_of_day(start),
+                "bookingEndTime": end_of_day(end),
                 "bookingNumberOfPeople": 1,
                 "roomServices": [],
                 "contractTemplateId": template_id,
@@ -841,13 +1010,12 @@ class Importer:
         self.step("contract", number, "created", created["id"], template_name)
 
     def invoices_by_period(self, booking_id: str) -> dict:
-        """Invoices of this booking, keyed by the payment period on the rent line."""
         found = self.client.items(
             self.urls["payment"],
             "invoices",
             "InvoiceQueryInput",
             "id code paidAmount status invoiceItems { paymentPeriodId } transactions { id }",
-            {"bookings": {"bookingId": {"eq": booking_id}}},
+            {"bookings": {"some": {"bookingId": {"eq": booking_id}}}},
         )
         by_period = {}
         for invoice in found:
@@ -865,14 +1033,47 @@ class Importer:
             return True
         return str(invoice.get("status") or "").lower() == "paid"
 
+    def invoice_item_for_period(self, booking: dict, period: dict, period_id: str, amount: float) -> dict:
+        start, end = period["start"], period["end"]
+        building = booking["building"]
+        room_id = next(
+            (
+                self.rooms[building, space["room"]]["id"]
+                for space in booking["spaces"]
+                if (building, space["room"]) in self.rooms
+            ),
+            "",
+        )
+        if not room_id:
+            raise SmartOSError("Không có phòng để lập hóa đơn cho kỳ thanh toán")
+        return {
+            "category": graphql_enum("payment-period"),
+            "name": i18n("Tiền thuê"),
+            "startTime": start_of_day(start),
+            "endTime": end_of_day(end),
+            "quantity": 1,
+            "timeQuantity": [{
+                "unit": graphql_enum("months"),
+                "startTime": start_of_day(start),
+                "endTime": end_of_day(end),
+                "quantity": 1,
+                "unitPrice": amount,
+            }],
+            "unit": i18n("kỳ"),
+            "unitPrice": amount,
+            "discountAmount": 0,
+            "paymentPeriodId": period_id,
+            "metadata": {
+                "roomId": room_id,
+                "packageUnit": graphql_enum("months"),
+                "monthlyCalculationType": "Cycle",
+                "daysOfMonthCalculationType": "DaysOfCalendar",
+            },
+        }
+
     def invoice_elapsed_periods(self, as_of: date, booking: dict, booking_id: str, name: str, reused: bool = False):
         start = booking["start"]
         end = booking["end"]
-        mode, duration = booking["cycle"]
-        step = span_months(start, end) if mode == "full" else duration
-        due = [period for period in cycle_periods(start, end, step) if period["end"] < as_of]
-        if not due:
-            return
         stored = self.client.items(
             self.urls["reservation"],
             "paymentPeriods",
@@ -880,71 +1081,89 @@ class Importer:
             "id totalAmount startDate endDate",
             {"bookingId": {"eq": booking_id}},
         )
-        by_start = {as_day(item.get("startDate")): item for item in stored}
+        due = elapsed_pms_periods(stored, start, end, as_of)
+        if not due:
+            if reused:
+                return
+            mode, duration = booking["cycle"]
+            step = span_months(start, end) if mode == "full" else duration
+            due = [
+                (period, None)
+                for period in cycle_periods(start, end, step)
+                if period["end"] < as_of
+            ]
+        if not due:
+            return
         existing = self.invoices_by_period(booking_id)
-        monthly = sum(space["rent"] for space in booking["spaces"])
+        monthly = sum(float(space["rent"] or 0) for space in booking["spaces"])
         building = booking["building"]
         customer_id = self.customers[self.customer_key(booking)]
         method = self.transfer_method_id(self.locations[building])
-        for index, period in enumerate(due, start=1):
-            start = period["start"]
-            end = period["end"]
-            stored_period = by_start.get(start)
-            if stored_period is None and reused:
-                self.step("invoice", name, "skipped", detail=f"Không thấy payment period bắt đầu {start.isoformat()}")
-                continue
-            amount = float(stored_period["totalAmount"]) if stored_period and stored_period.get("totalAmount") else monthly * period["months"]
-            period_id = stored_period["id"] if stored_period else f"{booking_id}:period:{index}"
-            invoice = existing.get(str(period_id))
-            if invoice:
-                self.step("invoice", name, "reused", invoice["id"], invoice.get("code") or "")
-                if amount <= 0 or self.invoice_collected(invoice, amount):
-                    if amount > 0:
-                        self.step("transaction", name, "reused", invoice["id"])
-                    continue
-                self.collect_period(booking, booking_id, name, invoice["id"], amount, start, building, customer_id, method)
-                continue
-            invoices = self.client.mutate(
-                self.urls["payment"],
-                "createInvoices",
-                "CreateInvoicesCommandInput",
-                "id code",
-                {
-                    "issueDate": iso(start),
-                    "dueDate": iso(end if end >= start else start),
-                    "saveAndConfirm": True,
-                    "isSingleInvoice": True,
-                    "locationId": self.locations[building],
-                    "invoices": [{
-                        "type": "booking",
-                        "bookingId": booking_id,
-                        "invoiceItems": [{
-                            "category": "payment-period",
-                            "name": i18n("Tiền thuê"),
-                            "startTime": iso(start),
-                            "endTime": iso(end),
-                            "quantity": 1,
-                            "unit": i18n("kỳ"),
-                            "unitPrice": amount,
-                            "discountAmount": 0,
-                            "paymentPeriodId": period_id,
-                        }],
-                    }],
-                },
-            )
-            invoice = invoices[0] if isinstance(invoices, list) else invoices
-            self.step("invoice", name, "created", invoice["id"], invoice.get("code", ""))
-            if amount <= 0:
-                continue
+        for index, (period, stored_period) in enumerate(due, start=1):
+            try:
+                self._upsert_period_invoice(
+                    booking, booking_id, name, period, index, stored_period, existing, monthly,
+                    building, customer_id, method,
+                )
+            except (SmartOSError, Exception) as caught:
+                self.record_booking_issue(booking, caught, "invoice")
+
+    def _upsert_period_invoice(
+        self, booking, booking_id, name, period, index, stored_period, existing, monthly,
+        building, customer_id, method,
+    ):
+        start = period["start"]
+        end = period["end"]
+        amount = float(stored_period["totalAmount"]) if stored_period and stored_period.get("totalAmount") else monthly * period["months"]
+        period_id = stored_period["id"] if stored_period else f"{booking_id}:period:{index}"
+        invoice = existing.get(str(period_id))
+        if invoice:
+            self.step("invoice", name, "reused", invoice["id"], invoice.get("code") or "")
+            if amount <= 0 or self.invoice_collected(invoice, amount):
+                if amount > 0:
+                    self.step("transaction", name, "reused", invoice["id"])
+                return
             self.collect_period(booking, booking_id, name, invoice["id"], amount, start, building, customer_id, method)
+            return
+        invoice_input = {
+            "type": graphql_enum("booking"),
+            "bookingId": booking_id,
+            "invoiceItems": [self.invoice_item_for_period(booking, period, period_id, amount)],
+        }
+        rates = usd_exchange_rates(booking)
+        if rates:
+            invoice_input["exchangeRates"] = rates
+            invoice_input["bookingExchangeRates"] = rates
+        payload = {
+            "issueDate": start_of_day(start),
+            "dueDate": end_of_day(end if end >= start else start),
+            "saveAndConfirm": True,
+            "isSingleInvoice": True,
+            "locationId": self.locations[building],
+            "invoices": [invoice_input],
+        }
+        if rates:
+            payload["exchangeRates"] = rates
+        invoices = self.client.mutate(
+            self.urls["payment"],
+            "createInvoices",
+            "CreateInvoicesCommandInput",
+            "id code",
+            payload,
+        )
+        invoice = invoices[0] if isinstance(invoices, list) else invoices
+        self.step("invoice", name, "created", invoice["id"], invoice.get("code", ""))
+        if amount <= 0:
+            return
+        self.collect_period(booking, booking_id, name, invoice["id"], amount, start, building, customer_id, method)
 
     def collect_period(self, booking, booking_id, name, invoice_id, amount, start, building, customer_id, method):
         payload = {
             "bookingId": booking_id,
             "invoices": [{"id": invoice_id, "amount": amount}],
-            "paymentMethodType": "bank",
+            "paymentMethodType": graphql_enum("bank"),
             "amount": amount,
-            "transactionDate": iso(start),
+            "transactionDate": start_of_day(start),
             "locationId": self.locations[building],
             "customerId": customer_id,
             "note": booking["contract_no"] or "",
@@ -970,20 +1189,66 @@ class Importer:
 
 
 class PreviewClient:
-    """Does not call the network. Records each mutation and returns a symbolic id for later calls."""
+    """Records mutations locally; does not call PMS."""
 
     def __init__(self):
         self.calls: list[dict] = []
         self._bookings: dict[str, dict] = {}
+        self.locations: dict[str, dict] = {}
+        self.floors: list[dict] = []
+        self.services: dict[str, dict] = {}
+
+    def seed_catalog(self, spaces: list[dict]):
+        for space in spaces:
+            building = space["building"]
+            if building not in self.locations:
+                self.locations[building] = {"id": f"@location:{building}", "name": building}
+            location_id = self.locations[building]["id"]
+            floor_name = space["floor"]
+            if not any(item["locationId"] == location_id and item["name"]["original"] == floor_name for item in self.floors):
+                self.floors.append({
+                    "id": f"@floor:{building}/{floor_name}",
+                    "name": {"original": floor_name},
+                    "locationId": location_id,
+                })
+            folded = search_text(space["service"])
+            self.services.setdefault(folded, {
+                "id": f"@service:{space['service']}",
+                "name": {"original": space["service"]},
+                "searchText": folded,
+            })
 
     def items(self, url: str, field: str, input_type: str, selection: str, filt: dict) -> list:
+        if field == "paymentPeriods":
+            return self._preview_periods(filt)
         if field == "paymentMethods":
             return [{"id": "@paymentMethod:bank", "type": "bank"}]
         if field == "contractTemplates":
             folded = (filt.get("searchText") or {}).get("eq") or ""
             return [{"id": f"@contractTemplate:{folded}", "name": folded, "searchText": folded}]
-        if field != "paymentPeriods":
-            return []
+        if field == "locations":
+            folded = (filt.get("searchText") or {}).get("eq")
+            name = (filt.get("name") or {}).get("eq")
+            if not folded and not name:
+                return list(self.locations.values())
+            if folded:
+                item = next(
+                    (value for value in self.locations.values() if search_text(value["name"]) == folded),
+                    None,
+                )
+                return [item] if item else []
+            item = self.locations.get(name)
+            return [item] if item else []
+        if field == "floors":
+            location_id = (filt.get("locationId") or {}).get("eq")
+            return [item for item in self.floors if item["locationId"] == location_id]
+        if field == "services":
+            folded = (filt.get("searchText") or {}).get("eq")
+            item = self.services.get(folded)
+            return [item] if item else list(self.services.values())
+        return []
+
+    def _preview_periods(self, filt: dict) -> list:
         booking_id = (filt.get("bookingId") or {}).get("eq")
         booking = self._bookings.get(booking_id)
         if not booking:
@@ -1001,8 +1266,8 @@ class PreviewClient:
             {
                 "id": f"{booking_id}:period:{index}",
                 "totalAmount": monthly * period["months"],
-                "startDate": iso(period["start"]),
-                "endDate": iso(period["end"]),
+                "startDate": start_of_day(period["start"]),
+                "endDate": end_of_day(period["end"]),
             }
             for index, period in enumerate(cycle_periods(start, end, duration), start=1)
         ]
@@ -1045,11 +1310,6 @@ class PreviewClient:
                 for index, package in enumerate(payload["packages"])
             ]
         if field == "createInvoices":
-            self.calls[-1]["previewNote"] = (
-                "Mỗi payment period có endDate trước ngày chạy file là một invoice. "
-                "issueDate và transactionDate là startDate của period đó. "
-                "Payment method mặc định là Transfer (bank)."
-            )
             return [{"id": ref, "code": None}]
         if field == "createInvoicePaymentTransaction":
             return {"id": ref, "code": None}
@@ -1068,19 +1328,14 @@ class PreviewClient:
 
 
 def call_title(field: str, payload: dict) -> str:
-    if field in {"createServiceCategory", "createService", "createFloor", "createRoom", "createExtraServiceType"}:
+    if field == "createRoom":
         return (payload.get("name") or {}).get("original") or field
-    if field == "createLocation":
-        return payload.get("name") or field
     if field == "createCompany":
         return (payload.get("companyName") or {}).get("vi") or field
     if field == "createIndividual":
         return payload.get("contactName") or field
     if field == "createBooking":
         return payload.get("note") or payload.get("startTime") or field
-    if field == "updateBookingRoomServices":
-        services = payload.get("roomServices") or [{}]
-        return str((services[0] or {}).get("price", field))
     if field == "createInvoices":
         booking = (payload.get("invoices") or [{}])[0].get("bookingId", "")
         return str(booking)
@@ -1094,44 +1349,300 @@ def call_title(field: str, payload: dict) -> str:
 
 
 API_FILLS = {
-    "createServiceCategory": ["id", "searchText"],
-    "createLocation": ["id", "uniqueKey", "searchText", "totalRooms", "totalArea", "totalFloors"],
-    "createService": ["id", "uniqueKey", "searchText"],
-    "createFloor": ["id", "uniqueKey", "searchText", "priority", "totalRooms"],
     "createRoom": ["id", "uniqueKey", "searchText", "priority", "totalPackages", "serviceIds"],
     "mutatePackages": ["id", "uniqueKey", "searchText"],
-    "createExtraServiceType": ["id", "uniqueKey", "searchText"],
     "createCompany": ["id", "companyCode", "uniqueKey", "searchText"],
     "createIndividual": ["id", "individualCode", "searchText"],
     "createBooking": ["id", "code", "paymentPeriods"],
-    "updateBookingRoomServices": ["roomServices"],
     "createInvoices": ["id", "code", "codeNumber"],
     "createInvoicePaymentTransaction": ["id", "code", "transactionTypeId"],
     "createContract": ["id", "code", "status"],
 }
 
 
-def preview_workbook(path) -> dict:
+def _workbook_result(
+    as_of,
+    errors,
+    calls,
+    skipped,
+    error,
+    steps=None,
+    imported=False,
+    summary=None,
+    path=None,
+) -> dict:
+    payload = {
+        "asOf": as_of.isoformat() if hasattr(as_of, "isoformat") else as_of,
+        "errors": errors,
+        "calls": calls,
+        "skipped": skipped,
+        "error": error,
+        "steps": steps or [],
+        "imported": imported,
+        "summary": summary or {"created": {}, "reused": {}, "vacantRooms": 0},
+    }
+    if errors and path:
+        try:
+            payload["errorReport"] = {
+                "filename": "bao-cao-loi.xlsx",
+                "content": base64.b64encode(build_error_report(path, errors)).decode("ascii"),
+            }
+        except Exception:
+            payload["errorReport"] = None
+    return payload
+
+
+def preview_workbook(path, domain: str = "", access_token: str = "", refresh_token: str = "") -> dict:
     data = read_onboarding(path)
     as_of = data["asOf"]
     if data["errors"]:
-        return {"asOf": as_of.isoformat(), "errors": data["errors"], "calls": [], "skipped": [], "error": ""}
+        return _workbook_result(as_of, data["errors"], [], [], "", path=path)
     client = PreviewClient()
+    client.seed_catalog(data["spaces"])
     urls = {key: key for key in ("property", "customer", "reservation", "payment", "contract")}
-    options = {
-        "representativeId": "<representativeId>",
-        "categoryIcon": "<categoryIcon>",
-        "categoryColor": "#1C1917",
-        "extraServiceCategoryId": "<extraServiceCategoryId>",
-        "unitId": "<unitId>",
-        "paymentMethodId": "",
-    }
-    importer = Importer(client, urls, options)
+    importer = Importer(client, urls, {"paymentMethodId": ""})
     result = importer.run(as_of, data["spaces"], data["bookings"])
-    return {
-        "asOf": as_of.isoformat(),
-        "errors": importer.issues,
-        "calls": client.calls,
-        "skipped": [item for item in result["steps"] if item["status"] == "skipped"],
-        "error": result.get("error") or "",
+    return _workbook_result(
+        as_of,
+        importer.issues,
+        client.calls,
+        [item for item in result["steps"] if item["status"] == "skipped"],
+        result.get("error") or "",
+        result["steps"],
+        summary=importer.summary(),
+        path=path,
+    )
+
+
+class LiveClient:
+
+    def __init__(self, namespace: str, access_token: str, refresh_token: str = ""):
+        self.namespace = namespace
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.calls: list[dict] = []
+
+    def refresh_if_possible(self):
+        if not self.refresh_token:
+            return
+        try:
+            tokens = refresh_tokens(self.namespace, self.refresh_token)
+        except IdentityError:
+            return
+        self.access_token = tokens["accessToken"]
+        self.refresh_token = tokens["refreshToken"]
+
+    def graphql(self, url: str, query: str, variables: dict | None = None, retry: bool = True) -> dict:
+        try:
+            return graphql(query, variables, self.namespace, self.access_token, url=url, timeout=60)
+        except IdentityError as error:
+            if retry and self.refresh_token and (error.status_code == 401 or error.code == "SESSION_EXPIRED"):
+                self.refresh_if_possible()
+                return self.graphql(url, query, variables, retry=False)
+            raise SmartOSError(str(error)) from error
+
+    def items(self, url: str, field: str, input_type: str, selection: str, filt: dict) -> list:
+        if field == "paymentMethods":
+            location_id = (filt.get("locationId") or {}).get("eq")
+            if not location_id:
+                return []
+            data = self.graphql(
+                url,
+                f"query($locationId: ObjectID!) {{ paymentMethods(locationId: $locationId) {{ {selection} }} }}",
+                {"locationId": location_id},
+            )
+            rows = data.get("paymentMethods") or []
+            wanted = (filt.get("type") or {}).get("eq")
+            return [
+                item
+                for item in rows
+                if not wanted or graphql_enum(item.get("type")) == graphql_enum(wanted)
+            ]
+
+        extra_defs = ""
+        extra_args = ""
+        extra_vars: dict = {}
+        graphql_filter = _graphql_filter(field, filt)
+        if field == "floors":
+            location_id = (filt.get("locationId") or {}).get("eq")
+            if not location_id:
+                return []
+            extra_defs = ", $locationId: ObjectID!"
+            extra_args = ", locationId: $locationId"
+            extra_vars["locationId"] = location_id
+
+        collected = []
+        page = 1
+        size = 100
+        while page <= 50:
+            payload: dict = {"paginate": {"page": page, "size": size}}
+            if graphql_filter:
+                payload["filter"] = graphql_filter
+            try:
+                data = self.graphql(
+                    url,
+                    f"""
+                    query($input: {input_type}!{extra_defs}) {{
+                      {field}(input: $input{extra_args}) {{
+                        items {{ {selection} }}
+                      }}
+                    }}
+                    """,
+                    {"input": payload, **extra_vars},
+                )
+            except SmartOSError as error:
+                raise SmartOSError(f"{error} [{field}]") from error
+            result = data.get(field)
+            batch = _rows_from_list(result)
+            collected.extend(batch)
+            if len(batch) < size:
+                break
+            page += 1
+        return collected
+
+    def mutate(self, url: str, field: str, input_type: str, selection: str, payload: dict):
+        try:
+            data = self.graphql(
+                url,
+                f"""
+                mutation($input: {input_type}!) {{
+                  {field}(input: $input) {{
+                    {selection}
+                  }}
+                }}
+                """,
+                {"input": payload},
+            )
+        except SmartOSError as error:
+            raise SmartOSError(f"{error} [{field}]") from error
+        self.calls.append({
+            "mutation": field,
+            "service": url,
+            "inputType": input_type,
+            "title": call_title(field, payload),
+            "input": payload,
+            "apiFills": API_FILLS.get(field, ["id"]),
+        })
+        return data.get(field)
+
+    def call(self, url: str, query: str, variables: dict | None = None) -> dict:
+        data = self.graphql(url, query, variables)
+        self.calls.append({
+            "mutation": "completeBooking",
+            "service": url,
+            "inputType": "id",
+            "title": (variables or {}).get("id", ""),
+            "input": variables or {},
+            "apiFills": [],
+        })
+        return data
+
+
+def _i18n_texts(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    texts = []
+    original = value.get("original")
+    if original:
+        texts.append(str(original).strip())
+    for key in ("en", "vi", "fr", "ja"):
+        content = value.get(key)
+        if content:
+            texts.append(str(content).strip())
+    for row in value.get("translations") or []:
+        if not isinstance(row, dict):
+            continue
+        content = row.get("content")
+        if content:
+            texts.append(str(content).strip())
+    return [item for item in texts if item]
+
+
+def _service_matches(item: dict, name: str, folded: str) -> bool:
+    """Match Excel name against original, translations, or joined searchText slugs."""
+    labels = _i18n_texts(item.get("name"))
+    stored = str(item.get("searchText") or "")
+    wanted = name.strip().casefold()
+    if any(label.casefold() == wanted or search_text(label) == folded for label in labels):
+        return True
+    if folded and folded in stored:
+        return True
+    return folded in {part for part in stored.split(":") if part}
+
+
+def _service_missing_message(name: str, found: list[dict]) -> str:
+    labels = []
+    for item in found:
+        labels.extend(_i18n_texts(item.get("name")) or [str(item.get("searchText") or item.get("id") or "")])
+    shown = ", ".join(item for item in dict.fromkeys(labels) if item)
+    if shown:
+        return (
+            f'Dịch vụ "{name}" không khớp tên trên hệ thống. '
+            f'PMS đang có: {shown}. Đổi tên cột Dịch vụ cho đúng hoặc gán service vào tòa nhà.'
+        )
+    return (
+        f'Dịch vụ "{name}" chưa có trên hệ thống. '
+        "Tạo service và gán vào tòa nhà trước khi import phòng."
+    )
+
+
+def _graphql_filter(field: str, filt: dict) -> dict:
+    """LocationFilterInput has searchText, not name. Drop name from every list filter."""
+    out = {}
+    for key, value in (filt or {}).items():
+        if key == "name":
+            eq = value.get("eq") if isinstance(value, dict) else None
+            if eq and "searchText" not in (filt or {}) and "searchText" not in out:
+                out["searchText"] = {"eq": search_text(eq)}
+            continue
+        out[key] = value
+    if field == "locations":
+        return {key: value for key, value in out.items() if key != "name"}
+    return out
+
+
+def _rows_from_list(result) -> list:
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("items", "data", "nodes"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def import_workbook(path, domain: str, access_token: str, refresh_token: str = "") -> dict:
+    data = read_onboarding(path)
+    as_of = data["asOf"]
+    if data["errors"]:
+        return _workbook_result(as_of, data["errors"], [], [], "", path=path)
+    namespace = namespace_of(domain)
+    if not namespace or not (access_token or "").strip():
+        raise SmartOSError("Cần đăng nhập trước khi ghi dữ liệu")
+    client = LiveClient(namespace, access_token.strip(), (refresh_token or "").strip())
+    client.refresh_if_possible()
+    urls = {
+        key: service_graphql_url(key)
+        for key in ("property", "customer", "reservation", "payment", "contract")
     }
+    importer = Importer(client, urls, {"paymentMethodId": ""})
+    result = importer.run(as_of, data["spaces"], data["bookings"])
+    payload = _workbook_result(
+        as_of,
+        importer.issues,
+        client.calls,
+        [item for item in result["steps"] if item["status"] == "skipped"],
+        "",
+        result["steps"],
+        imported=True,
+        summary=importer.summary(),
+        path=path,
+    )
+    payload["accessToken"] = client.access_token
+    payload["refreshToken"] = client.refresh_token
+    return payload

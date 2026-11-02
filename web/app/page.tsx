@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type ImportStep = {
   action: string;
@@ -17,7 +17,6 @@ type ApiCall = {
   title: string;
   input: Record<string, unknown>;
   apiFills: string[];
-  previewNote?: string;
 };
 
 type ImportIssue = {
@@ -27,12 +26,179 @@ type ImportIssue = {
   message: string;
 };
 
+type ImportSummary = {
+  created?: Record<string, number>;
+  reused?: Record<string, number>;
+  vacantRooms?: number;
+};
+
+type ErrorReport = {
+  filename: string;
+  content: string;
+};
+
 type PreviewResponse = {
   asOf: string;
   errors: ImportIssue[];
   calls: ApiCall[];
   skipped: ImportStep[];
   error: string;
+  steps?: ImportStep[];
+  imported?: boolean;
+  summary?: ImportSummary;
+  errorReport?: ErrorReport | null;
+  accessToken?: string;
+  refreshToken?: string;
+};
+
+type Me = {
+  id?: string;
+  accountId?: string;
+  accountType?: string;
+  fullName?: string;
+  email?: string;
+  phoneNumber?: string;
+  phoneNumberDialIndex?: string;
+  contactPhoneNumber?: string;
+  contactPhoneNumberDialIndex?: string;
+  avatar?: string;
+  locationIds?: string[];
+  businessId?: string;
+  customerId?: string;
+  namespace?: string;
+  isActive?: boolean;
+  fullPhoneNumber?: string;
+  modules?: string[];
+  policies?: string[];
+};
+
+type Session = {
+  domain: string;
+  accessToken: string;
+  refreshToken: string;
+  me: Me;
+};
+
+const SESSION_KEY = "smartos-migrate-session";
+const API_ORIGIN = (process.env.NEXT_PUBLIC_MIGRATE_API_ORIGIN || "").replace(/\/$/, "");
+
+function apiUrl(route: string) {
+  return API_ORIGIN ? `${API_ORIGIN}/${route}` : `/api/${route}`;
+}
+
+function explainFetchFailure(caught: unknown, fallback: string) {
+  const message = caught instanceof Error ? caught.message : fallback;
+  if (message === "Failed to fetch" || message.includes("NetworkError")) {
+    return API_ORIGIN
+      ? `Không gọi được ${API_ORIGIN}. Uvicorn có thể đang reload, hoặc CORS/chặn kết nối. Thử lại khi API sẵn sàng.`
+      : "Không kết nối được API Python. Chạy uvicorn ở thư mục backend, cổng 8000.";
+  }
+  return message;
+}
+
+async function readApiJson(response: Response) {
+  const raw = await response.text();
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    if (response.status === 502 || response.status === 504) {
+      throw new Error(
+        "Next.js hết thời gian chờ khi API Python vẫn đang chạy. Đặt NEXT_PUBLIC_MIGRATE_API_ORIGIN=http://127.0.0.1:8000 rồi restart next dev.",
+      );
+    }
+    throw new Error(
+      response.status >= 500
+        ? `API trả HTTP ${response.status}, không phải JSON.`
+        : "API trả về dữ liệu không hợp lệ",
+    );
+  }
+}
+
+function readSession(): Session | null {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Session;
+    if (!parsed?.accessToken || !parsed?.domain) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function sessionLabel(session: Session) {
+  return session.me.fullName || session.me.email || session.me.accountId || session.domain;
+}
+
+const FILE_ERROR_CODES = new Set([
+  "E01",
+  "E02",
+  "E03",
+  "E04",
+  "E05",
+  "E06",
+  "E07",
+  "E08",
+  "E09",
+  "E10",
+  "E11",
+  "E12",
+  "E14",
+]);
+
+const RESULT_ORDER = [
+  "room",
+  "package",
+  "booking",
+  "customer",
+  "invoice",
+  "transaction",
+  "contract",
+  "completeBooking",
+];
+
+const RESULT_LABELS: Record<string, string> = {
+  room: "Room",
+  package: "Package",
+  booking: "Booking",
+  customer: "Khách",
+  invoice: "Hóa đơn",
+  transaction: "Giao dịch",
+  contract: "Hợp đồng",
+  completeBooking: "Booking đã kết thúc",
+  location: "Tòa",
+  floor: "Tầng",
+  service: "Dịch vụ",
+};
+
+const DATABASE_TABLES: Record<string, string> = {
+  createRoom: "property.rooms, property.packages",
+  mutatePackages: "property.packages",
+  createCompany: "customer.customers",
+  createIndividual: "customer.customers",
+  createBooking: "reservation.bookings, reservation.paymentperiods",
+  createInvoices: "payment.invoices, payment.invoice_items",
+  createInvoicePaymentTransaction: "payment.transactions, payment.invoice_allocations",
+  completeBooking: "reservation.bookings",
+  createContract: "contract.contracts",
+  room: "property.rooms",
+  customer: "customer.customers",
+  booking: "reservation.bookings",
+  location: "property.locations",
+  floor: "property.floors",
+  service: "property.services",
+};
+
+const SALES_COLUMNS: Record<string, string[]> = {
+  createRoom: ["Phòng", "Tòa", "Tầng", "Diện tích", "Đơn giá", "Cách tính"],
+  createCompany: ["Khách", "Email", "MST", "Người đại diện", "Tòa"],
+  createIndividual: ["Khách", "Email", "Tòa"],
+  mutatePackages: ["Phòng", "Đơn giá"],
+  createBooking: ["Khách", "Tòa", "Ghi chú", "Bắt đầu", "Kết thúc", "Kỳ", "Cọc", "Số phòng", "Tiền tệ", "Tỷ giá"],
+  createInvoices: ["Booking", "Ngày phát hành", "Hạn thanh toán", "Số dòng"],
+  createInvoicePaymentTransaction: ["Khách", "Số tiền", "Ngày", "Phương thức"],
+  completeBooking: ["Booking"],
+  createContract: ["Số hợp đồng", "Mẫu hợp đồng", "Booking", "Bắt đầu", "Kết thúc"],
 };
 
 export default function HomePage() {
@@ -43,6 +209,16 @@ export default function HomePage() {
   const [selectedMutation, setSelectedMutation] = useState("");
   const [query, setQuery] = useState("");
   const [payloadCall, setPayloadCall] = useState<ApiCall | null>(null);
+  const [session, setSession] = useState<Session | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [loginError, setLoginError] = useState("");
+  const [domain, setDomain] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const pendingImport = useRef(false);
 
   const groups = useMemo(() => {
     const map = new Map<string, ApiCall[]>();
@@ -68,13 +244,79 @@ export default function HomePage() {
   });
 
   useEffect(() => {
-    if (!payloadCall) return;
+    const current = readSession();
+    setSession(current);
+    if (current?.me?.businessId) {
+      console.log("me.businessId", current.me.businessId);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!payloadCall && !loginOpen && !confirmOpen) return;
     function onKey(event: KeyboardEvent) {
-      if (event.key === "Escape") setPayloadCall(null);
+      if (event.key === "Escape") {
+        setPayloadCall(null);
+        setLoginOpen(false);
+        setConfirmOpen(false);
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [payloadCall]);
+  }, [payloadCall, loginOpen, confirmOpen]);
+
+  async function onLogin(event: React.FormEvent) {
+    event.preventDefault();
+    setLoginLoading(true);
+    setLoginError("");
+    try {
+      const response = await fetch(apiUrl("login"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ domain, username, password }),
+      });
+      const payload = (await readApiJson(response)) as { detail?: string } & Partial<Session>;
+      if (!response.ok) {
+        throw new Error(payload.detail || "Đăng nhập không thành công");
+      }
+      if (!payload.accessToken || !payload.domain) {
+        throw new Error("Identity API không trả accessToken");
+      }
+      const next: Session = {
+        domain: payload.domain,
+        accessToken: payload.accessToken,
+        refreshToken: payload.refreshToken || "",
+        me: payload.me || {},
+      };
+      localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+      setSession(next);
+      console.log("me.businessId", next.me.businessId);
+      setLoginOpen(false);
+      setPassword("");
+      if (pendingImport.current) {
+        pendingImport.current = false;
+        setConfirmOpen(true);
+      }
+    } catch (caught) {
+      setLoginError(explainFetchFailure(caught, "Đăng nhập không thành công"));
+    } finally {
+      setLoginLoading(false);
+    }
+  }
+
+  async function onLogout() {
+    const current = session;
+    setSession(null);
+    localStorage.removeItem(SESSION_KEY);
+    if (!current) return;
+    try {
+      await fetch(apiUrl("logout"), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ domain: current.domain, accessToken: current.accessToken }),
+      });
+    } catch {
+    }
+  }
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -84,18 +326,8 @@ export default function HomePage() {
     try {
       const body = new FormData();
       body.append("file", file);
-      const response = await fetch("/api/preview", { method: "POST", body });
-      const raw = await response.text();
-      let payload: { detail?: string } = {};
-      try {
-        payload = raw ? JSON.parse(raw) : {};
-      } catch {
-        throw new Error(
-          response.status >= 500
-            ? "Không kết nối được API Python. Chạy uvicorn ở thư mục backend, cổng 8000."
-            : "API trả về dữ liệu không hợp lệ",
-        );
-      }
+      const response = await fetch(apiUrl("preview"), { method: "POST", body });
+      const payload = (await readApiJson(response)) as { detail?: string };
       if (!response.ok) {
         throw new Error(payload.detail || "Không đọc được file");
       }
@@ -105,14 +337,83 @@ export default function HomePage() {
       setQuery("");
       if (data.error) setError(data.error);
     } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "Không đọc được file";
-      setError(
-        message === "Failed to fetch"
-          ? "Không kết nối được API Python. Chạy uvicorn ở thư mục backend, cổng 8000."
-          : message,
-      );
+      setError(explainFetchFailure(caught, "Không đọc được file"));
     } finally {
       setLoading(false);
+    }
+  }
+
+  const fileErrors = (preview?.errors ?? []).filter((item) => FILE_ERROR_CODES.has(item.code));
+  const previewReady = Boolean(preview && fileErrors.length === 0);
+  const createdCount = (preview?.steps ?? []).filter((item) => item.status === "created").length;
+  const reusedCount = (preview?.steps ?? []).filter((item) => item.status === "reused").length;
+  const created = preview?.summary?.created ?? {};
+  const vacantRooms = preview?.summary?.vacantRooms ?? 0;
+
+  function downloadErrorReport() {
+    const report = preview?.errorReport;
+    if (!report?.content) return;
+    const binary = atob(report.content);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    const blob = new Blob([bytes], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = report.filename || "bao-cao-loi.xlsx";
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function onImportClick() {
+    if (!file || !previewReady || loading || importing) return;
+    if (!session) {
+      pendingImport.current = true;
+      setLoginOpen(true);
+      return;
+    }
+    setConfirmOpen(true);
+  }
+
+  async function onConfirmImport() {
+    if (!file || !session) return;
+    setConfirmOpen(false);
+    setImporting(true);
+    setError("");
+    try {
+      const body = new FormData();
+      body.append("file", file);
+      body.append("domain", session.domain);
+      body.append("accessToken", session.accessToken);
+      body.append("refreshToken", session.refreshToken || "");
+      const response = await fetch(apiUrl("import"), { method: "POST", body });
+      const payload = (await readApiJson(response)) as { detail?: string };
+      if (!response.ok) {
+        throw new Error(payload.detail || "Không ghi được dữ liệu");
+      }
+      const data = payload as PreviewResponse;
+      setPreview(data);
+      setSelectedMutation(data.calls[0]?.mutation ?? "");
+      setQuery("");
+      if (data.accessToken) {
+        const next: Session = {
+          domain: session.domain,
+          accessToken: data.accessToken,
+          refreshToken: data.refreshToken || session.refreshToken,
+          me: session.me,
+        };
+        localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+        setSession(next);
+      }
+      if (data.error) setError(data.error);
+    } catch (caught) {
+      setError(explainFetchFailure(caught, "Không ghi được dữ liệu"));
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -128,6 +429,15 @@ export default function HomePage() {
 
 function displayDate(value: unknown) {
   const text = String(value ?? "");
+  const parsed = Date.parse(text);
+  if (!Number.isNaN(parsed)) {
+    return new Intl.DateTimeFormat("vi-VN", {
+      timeZone: "Asia/Ho_Chi_Minh",
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    }).format(new Date(parsed));
+  }
   const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(text);
   if (!match) return text;
   return `${match[3]}/${match[2]}/${match[1]}`;
@@ -137,6 +447,12 @@ function displayMoney(value: unknown) {
   const number = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(number)) return "";
   return new Intl.NumberFormat("vi-VN").format(number);
+}
+
+function displayRate(value: unknown) {
+  const rows = Array.isArray(value) ? value as { rate?: unknown }[] : [];
+  const rate = rows[0]?.rate;
+  return rate == null || rate === "" ? "" : displayMoney(rate);
 }
 
 function originalName(input: Record<string, unknown>) {
@@ -150,37 +466,18 @@ function originalName(input: Record<string, unknown>) {
 function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
   const input = call.input;
   const place = (value: unknown) => refTitle(calls, value);
-  if (call.mutation === "createServiceCategory") return [originalName(input)];
-  if (call.mutation === "createLocation") {
-    const address = input.address as { text?: string } | undefined;
-    return [String(input.name ?? ""), address?.text ?? ""];
-  }
-  if (call.mutation === "createService") {
-    const locations = Array.isArray(input.locationIds) ? input.locationIds.map(place).join(", ") : "";
-    return [originalName(input), locations];
-  }
-  if (call.mutation === "createFloor") {
-    const kinds = Array.isArray(input.rentalTypes)
-      ? input.rentalTypes.map((kind) => (kind === "area" ? "Khu vực" : "Phòng")).join(", ")
-      : "";
-    return [originalName(input), place(input.locationId), kinds];
-  }
   if (call.mutation === "createRoom") {
     const packages = Array.isArray(input.packages) ? input.packages[0] as Record<string, unknown> | undefined : undefined;
-    const priceType = packages?.priceType === "per-square-meter" ? "Theo m2" : "Theo phòng";
+    const rawType = String(packages?.priceType ?? "");
+    const priceType = rawType === "PER_SQUARE_METER" || rawType === "per-square-meter" ? "Theo m2" : "Theo phòng";
     return [
       originalName(input),
       place(input.locationId),
       place(input.floorId),
       String(input.area ?? ""),
-      input.isZone ? "Có" : "Không",
       displayMoney(packages?.amount),
       priceType,
     ];
-  }
-  if (call.mutation === "createExtraServiceType") {
-    const unit = input.unit as { original?: string } | undefined;
-    return [originalName(input), place(input.locationId), displayMoney(input.price), unit?.original ?? ""];
   }
   if (call.mutation === "createCompany") {
     const company = input.companyName as { vi?: string } | undefined;
@@ -208,13 +505,8 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
       deposit?.requiredAmount ? displayMoney(deposit.requiredAmount) : "0",
       String(roomCount),
       String(input.currency ?? ""),
+      displayRate(input.exchangeRates),
     ];
-  }
-  if (call.mutation === "updateBookingRoomServices") {
-    const services = Array.isArray(input.roomServices) ? input.roomServices as Record<string, unknown>[] : [];
-    const fee = services[0];
-    const unit = fee?.unit as { original?: string } | undefined;
-    return [place(input.id), displayMoney(fee?.price), unit?.original ?? ""];
   }
   if (call.mutation === "createInvoices") {
     const invoices = Array.isArray(input.invoices) ? input.invoices as Record<string, unknown>[] : [];
@@ -237,49 +529,25 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
   return [];
 }
 
-const DATABASE_TABLES: Record<string, string> = {
-  createServiceCategory: "property.servicecategories",
-  createLocation: "property.locations",
-  createService: "property.services",
-  createFloor: "property.floors",
-  createRoom: "property.rooms, property.packages",
-  mutatePackages: "property.packages",
-  createExtraServiceType: "reservation.extraservicetypes",
-  createCompany: "customer.customers",
-  createIndividual: "customer.customers",
-  createBooking: "reservation.bookings, reservation.paymentperiods",
-  updateBookingRoomServices: "reservation.bookings",
-  createInvoices: "payment.invoices, payment.invoice_items",
-  createInvoicePaymentTransaction: "payment.transactions, payment.invoice_allocations",
-  completeBooking: "reservation.bookings",
-  createContract: "contract.contracts",
-  room: "property.rooms",
-  booking: "reservation.bookings",
-  extraServiceType: "reservation.extraservicetypes",
-};
-
-const SALES_COLUMNS: Record<string, string[]> = {
-  createServiceCategory: ["Tên"],
-  createLocation: ["Tòa", "Địa chỉ"],
-  createService: ["Dịch vụ", "Tòa"],
-  createFloor: ["Tầng", "Tòa", "Loại"],
-  createRoom: ["Phòng", "Tòa", "Tầng", "Diện tích", "Zone", "Đơn giá", "Cách tính"],
-  createExtraServiceType: ["Tên", "Tòa", "Đơn giá", "Đơn vị"],
-  createCompany: ["Khách", "Email", "MST", "Người đại diện", "Tòa"],
-  createIndividual: ["Khách", "Email", "Tòa"],
-  mutatePackages: ["Phòng", "Đơn giá"],
-  createBooking: ["Khách", "Tòa", "Ghi chú", "Bắt đầu", "Kết thúc", "Kỳ", "Cọc", "Số phòng", "Tiền tệ"],
-  updateBookingRoomServices: ["Booking", "Phí dịch vụ/tháng", "Đơn vị"],
-  createInvoices: ["Booking", "Ngày phát hành", "Hạn thanh toán", "Số dòng"],
-  createInvoicePaymentTransaction: ["Khách", "Số tiền", "Ngày", "Phương thức"],
-  completeBooking: ["Booking"],
-  createContract: ["Số hợp đồng", "Mẫu hợp đồng", "Booking", "Bắt đầu", "Kết thúc"],
-};
-
   return (
     <main className="app">
       <header className="header">
         <h1>SMARTOS Onboarding Data Migration</h1>
+        {session ? (
+          <div className="session">
+            <div>
+              <strong>{sessionLabel(session)}</strong>
+              <span>{session.domain}</span>
+            </div>
+            <button type="button" className="download" onClick={onLogout}>
+              Logout
+            </button>
+          </div>
+        ) : (
+          <button type="button" onClick={() => setLoginOpen(true)}>
+            Login to PMS
+          </button>
+        )}
       </header>
 
       <form className="panel upload" onSubmit={onSubmit}>
@@ -288,8 +556,22 @@ const SALES_COLUMNS: Record<string, string[]> = {
           accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
           onChange={(event) => setFile(event.target.files?.[0] ?? null)}
         />
-        <button type="submit" disabled={!file || loading}>
-          {loading ? "Đang đọc..." : "Preview Migrated Data"}
+        <button type="submit" disabled={!file || loading || importing}>
+          {loading ? "Reading..." : "Preview Migrated Data"}
+        </button>
+        <button
+          type="button"
+          disabled={!file || !previewReady || loading || importing}
+          title={
+            !previewReady
+              ? "Preview successfully then upsert to database"
+              : session
+                ? "Upsert preview data to SmartOS"
+                : "Login then upsert to database"
+          }
+          onClick={onImportClick}
+        >
+          {importing ? "Upserting..." : "Upsert"}
         </button>
       </form>
       {error ? <p className="error">{error}</p> : null}
@@ -309,12 +591,57 @@ const SALES_COLUMNS: Record<string, string[]> = {
             <span>
               <strong>{preview.errors.length}</strong> lỗi
             </span>
+            {preview.imported || createdCount || reusedCount ? (
+              <>
+                <span>
+                  <strong>{createdCount}</strong> tạo mới
+                </span>
+                <span>
+                  <strong>{reusedCount}</strong> dùng lại
+                </span>
+              </>
+            ) : null}
           </section>
+          {preview.imported ? (
+            <section className="panel results">
+              <h2>Kết quả import</h2>
+              <div className="result-grid">
+                {RESULT_ORDER.map((key) => (
+                  <span key={key}>
+                    {RESULT_LABELS[key] ?? key} đã tạo{" "}
+                    <strong>{created[key] ?? 0}</strong>
+                  </span>
+                ))}
+                <span>
+                  Phòng trống (không có Booking) <strong>{vacantRooms}</strong>
+                </span>
+              </div>
+              <p className={preview.errors.length ? "note" : "note success"}>
+                {preview.errors.length
+                  ? `Đã ghi những bước thành công. ${preview.errors.length} lỗi PMS được ghi nhận, chỉnh sửa lại file và upload lại để tiếp tục upsert các record còn thiếu.`
+                  : "Đã ghi dữ liệu vào SmartOS. Chạy lại file sẽ tiếp tục từ record còn thiếu."}
+              </p>
+            </section>
+          ) : preview.errors.length === 0 ? (
+            <p className="note">
+              Đây là preview của input gửi vào mutation. Đăng nhập rồi bấm Upsert để ghi dữ liệu vào
+              database.
+            </p>
+          ) : null}
           {preview.errors.length > 0 ? (
             <section className="panel warnings">
-              <h2>
-                File chưa nhập được: {preview.errors.length} lỗi. Sửa trong file Excel rồi tải lại.
-              </h2>
+              <div className="panel-header">
+                <h2>
+                  {preview.imported
+                    ? `Tổng số lỗi: ${preview.errors.length}`
+                    : `File chưa nhập được: ${preview.errors.length} lỗi. Hãy chỉnh sửa lại các trường bị lỗi trong file Excel rồi upload lại file.`}
+                </h2>
+                {preview.errorReport ? (
+                  <button type="button" className="download" onClick={downloadErrorReport}>
+                    Tải file báo cáo lỗi
+                  </button>
+                ) : null}
+              </div>
               <div className="table-scroll">
                 <table>
                   <thead>
@@ -322,7 +649,7 @@ const SALES_COLUMNS: Record<string, string[]> = {
                       <th>Mã lỗi</th>
                       <th>Dòng</th>
                       <th>Cột</th>
-                      <th>Thông báo</th>
+                      <th>Chi tiết lỗi</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -331,19 +658,14 @@ const SALES_COLUMNS: Record<string, string[]> = {
                         <td>{item.code}</td>
                         <td>{item.row ?? ""}</td>
                         <td>{item.column ?? ""}</td>
-                        <td>{item.message}</td>
+                        <td className="error-detail">{item.message}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             </section>
-          ) : (
-            <p className="note">
-              Đây là input gửi vào mutation. id, uniqueKey, searchText và mã BK, INV, TX, COM do API
-              sinh.
-            </p>
-          )}
+          ) : null}
           {preview.skipped.length > 0 ? (
             <section className="panel warnings">
               <h2>{preview.skipped.length} records đã bỏ qua</h2>
@@ -403,7 +725,6 @@ const SALES_COLUMNS: Record<string, string[]> = {
                       {activeCalls[0]?.apiFills.length
                         ? ` · API tự sinh: ${activeCalls[0].apiFills.join(", ")}`
                         : ""}
-                      {activeCalls[0]?.previewNote ? ` · ${activeCalls[0].previewNote}` : ""}
                       . Bấm một dòng để xem input.
                     </p>
                   </div>
@@ -442,6 +763,100 @@ const SALES_COLUMNS: Record<string, string[]> = {
           ) : null}
         </>
       ) : null}
+      {confirmOpen ? (
+        <div className="popup-backdrop" onClick={() => setConfirmOpen(false)}>
+          <div
+            className="popup"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Ghi dữ liệu vào database"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="popup-header">
+              <strong>Ghi dữ liệu vào database</strong>
+              <button type="button" className="download" onClick={() => setConfirmOpen(false)}>
+                Đóng
+              </button>
+            </div>
+            <div className="login-form">
+              <p>
+                Ghi {preview?.calls.length ?? 0} lệnh API vào SmartOS của{" "}
+                <strong>{session?.domain}</strong>. Location, tầng và dịch vụ phải đã có trên hệ
+                thống.
+              </p>
+              <p className="popup-hint">
+                Nếu một lệnh PMS lỗi, tool ghi nhận lỗi rồi chạy tiếp các bước còn lại. Chạy lại cùng
+                file sẽ tiếp tục từ record còn thiếu và không tạo trùng invoice đã thanh toán.
+              </p>
+            </div>
+            <div className="popup-actions">
+              <button type="button" className="download" onClick={() => setConfirmOpen(false)}>
+                Hủy
+              </button>
+              <button type="button" className="primary" onClick={onConfirmImport} disabled={importing}>
+                {importing ? "Đang ghi..." : "Ghi vào database"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {loginOpen ? (
+        <div className="popup-backdrop" onClick={() => setLoginOpen(false)}>
+          <div
+            className="popup"
+            role="dialog"
+            aria-modal="true"
+            aria-label="login to PMS"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="popup-header">
+              <strong>Login to PMS</strong>
+              <button type="button" className="download" onClick={() => setLoginOpen(false)}>
+                Close
+              </button>
+            </div>
+            <form className="login-form" onSubmit={onLogin}>
+              <label>
+                Business domain (namespace)
+                <input
+                  value={domain}
+                  onChange={(event) => setDomain(event.target.value)}
+                  placeholder="namespace"
+                  autoComplete="url"
+                  required
+                />
+              </label>
+              <label>
+                Username
+                <input
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  placeholder="email"
+                  autoComplete="username"
+                  required
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  autoComplete="current-password"
+                  required
+                />
+              </label>
+              {loginError ? <p className="error">{loginError}</p> : null}
+              <div className="popup-actions">
+                <p className="popup-hint">Namespace is sent as header to identity-service.</p>
+                <button type="submit" className="primary" disabled={loginLoading}>
+                  {loginLoading ? "Logging in..." : "Login"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      ) : null}
       {payloadCall ? (
         <div className="popup-backdrop" onClick={() => setPayloadCall(null)}>
           <div
@@ -456,7 +871,7 @@ const SALES_COLUMNS: Record<string, string[]> = {
                 {payloadCall.mutation} · {payloadCall.title}
               </strong>
               <button type="button" className="download" onClick={() => setPayloadCall(null)}>
-                Đóng
+                Close
               </button>
             </div>
             <pre>{JSON.stringify(payloadCall.input, null, 2)}</pre>

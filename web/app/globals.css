@@ -24,8 +24,15 @@ textarea {
   padding: 28px 24px 48px;
 }
 
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 .header h1 {
-  margin: 0 0 6px;
+  margin: 0;
   font-size: 28px;
   font-weight: 650;
   letter-spacing: -0.03em;
@@ -35,6 +42,56 @@ textarea {
   margin: 0;
   max-width: 720px;
   color: #57534e;
+}
+
+.header > button {
+  border: 0;
+  border-radius: 8px;
+  background: #1c1917;
+  color: #fff;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+.session {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  text-align: right;
+}
+
+.session strong {
+  display: block;
+}
+
+.session span {
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+  color: #57534e;
+}
+
+.login-form {
+  display: grid;
+  gap: 12px;
+  padding: 16px 14px 0;
+}
+
+.login-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+  color: #44403c;
+}
+
+.login-form input {
+  border: 1px solid #d6d3d1;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.login-form .error {
+  margin: 0;
 }
 
 .panel {
@@ -95,6 +152,11 @@ textarea {
 .note {
   background: #fffbeb;
   color: #92400e;
+}
+
+.note.success {
+  background: #ecfdf5;
+  color: #065f46;
 }
 
 .summary {
@@ -223,6 +285,14 @@ td {
   cursor: pointer;
 }
 
+td.error-detail {
+  max-width: 640px;
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: unset;
+  word-break: break-word;
+}
+
 .popup-backdrop {
   position: fixed;
   inset: 0;
@@ -316,11 +386,50 @@ td {
   font-size: 16px;
 }
 
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.panel-header h2 {
+  margin: 0;
+}
+
+.results {
+  padding: 14px 16px 8px;
+}
+
+.results h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.result-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  color: #44403c;
+}
+
+.result-grid strong {
+  color: #1c1917;
+}
+
 .warnings li {
   margin-top: 8px;
 }
 
 @media (max-width: 900px) {
+  .header,
+  .session {
+    flex-direction: column;
+    align-items: stretch;
+    text-align: left;
+  }
+
   .workspace {
     grid-template-columns: 1fr;
   }
