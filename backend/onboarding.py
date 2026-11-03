@@ -121,17 +121,23 @@ def parse_cycle(value) -> tuple[str, int | None] | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return ("months", int(value)) if value > 0 and float(value).is_integer() else None
     raw = (text(value) or "").lower()
-    if "toàn bộ" in raw:
+    if not raw:
+        return None
+    folded = slug(raw)
+    tokens = set(folded.split("-"))
+    if "toan" in tokens and "bo" in tokens:
         return "full", None
     match = re.search(r"\d+", raw)
     count = int(match.group()) if match else 1
     if count <= 0:
         return None
-    if "quý" in raw:
+    if "nua" in tokens and "nam" in tokens:
+        return "months", 6 * count
+    if "quy" in tokens:
         return "months", 3 * count
-    if "năm" in raw:
+    if "nam" in tokens:
         return "months", 12 * count
-    if "tháng" in raw or re.fullmatch(r"\d+", raw):
+    if "thang" in tokens or re.fullmatch(r"\d+", raw.strip()):
         return "months", count
     return None
 
@@ -139,8 +145,15 @@ def parse_cycle(value) -> tuple[str, int | None] | None:
 def split_emails(value) -> list[str]:
     if blank(value):
         return []
-    parts = re.split(r"[;/,\n]+", str(value))
-    return [part.strip().lower() for part in parts if "@" in part]
+    emails = []
+    seen = set()
+    for part in re.split(r"[;/,\n]+", str(value)):
+        email = part.strip().lower()
+        if "@" not in email or email in seen:
+            continue
+        seen.add(email)
+        emails.append(email)
+    return emails
 
 
 def is_valid_email(value: str) -> bool:
@@ -298,8 +311,8 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
         fail(
             "E14",
             "cycle",
-            f'Dòng {number}: cột "Kỳ thanh toán" không đọc được, dùng Hàng tháng, 3 tháng, Hàng quý, Hàng năm '
-            "hoặc Đã thanh toán toàn bộ",
+            f'Dòng {number}: cột "Kỳ thanh toán" không đọc được, dùng Hàng tháng, 3 tháng, Hàng quý, '
+            "2 quý, nửa năm, Hàng năm hoặc Đã thanh toán toàn bộ",
         )
     deposit = 0.0 if blank(raw["deposit"]) else parse_number(raw["deposit"])
     if deposit is None or deposit < 0:
@@ -310,7 +323,7 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
 
     space.update({
         "tax": norm_tax(raw["tax"]),
-        "email": sorted(set(split_emails(raw["email"]))),
+        "email": split_emails(raw["email"]),
         "start": start,
         "end": end,
         "cycle": cycle,

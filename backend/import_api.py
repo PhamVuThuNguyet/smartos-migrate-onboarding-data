@@ -17,6 +17,7 @@ from onboarding import (
     looks_like_company,
     norm_tax,
     read_onboarding,
+    slug,
 )
 
 PMS_ERROR = "E16"
@@ -613,7 +614,7 @@ class Importer:
         if booking["tax"]:
             return f"tax:{booking['tax']}"
         kind = "company" if looks_like_company(name) else "name"
-        return f"{kind}:{name}"
+        return f"{kind}:{slug(name)}"
 
     def skip_invalid_email(self, booking: dict) -> bool:
         invalid = [email for email in booking["emails"] if not is_valid_email(email)]
@@ -781,13 +782,22 @@ class Importer:
     def ensure_booking(self, as_of: date, booking: dict):
         name = booking["name"]
         building = booking["building"]
+        spaces = booking["spaces"]
         ready = [
             (space, self.rooms[(building, space["room"])])
-            for space in booking["spaces"]
+            for space in spaces
             if (building, space["room"]) in self.rooms
         ]
-        if not ready:
-            self.step("booking", name, "skipped", detail="Không có phòng nào được tạo cho booking này")
+        if len(ready) != len(spaces):
+            missing = ", ".join(
+                space["room"] for space in spaces if (building, space["room"]) not in self.rooms
+            )
+            self.step(
+                "booking",
+                name,
+                "skipped",
+                detail=f"Không tạo booking vì còn phòng chưa sẵn sàng: {missing}",
+            )
             return
         matches = self.find_bookings(booking, ready)
         if len(matches) > 1:
