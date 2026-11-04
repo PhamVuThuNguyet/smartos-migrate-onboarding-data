@@ -95,13 +95,26 @@ def pms_issue_placement(message: str, booking: dict | None = None) -> tuple[str,
 
 
 def usd_exchange_rates(source: dict) -> list[dict]:
-    """createBooking/createInvoices exchangeRates from Excel Tỷ giá."""
+    """createBooking exchangeRates from Excel Tỷ giá (room/booking only)."""
     if source.get("currency") != "USD":
         return []
     rate = excel_fx_rate(source)
     if not rate:
         return []
     return [{"currency": "USD", "rate": rate}]
+
+
+def to_vnd_amount(source: dict, amount: float) -> float:
+    """Invoice/payment amounts are always VND; USD rows × Excel Tỷ giá."""
+    value = float(amount or 0)
+    if source.get("currency") != "USD":
+        return value
+    rate = excel_fx_rate(source)
+    if not rate:
+        raise SmartOSError(
+            f'Dòng {source.get("rows", ["?"])[0]}: tiền tệ USD nhưng cột "Tỷ giá" trống hoặc không hợp lệ'
+        )
+    return round(value * rate)
 
 
 def _as_iso(moment: datetime) -> str:
@@ -531,7 +544,7 @@ class Importer:
                 "packages": [{
                     "priceType": PRICE_TYPE_PER_ROOM,
                     "unit": PACKAGE_UNIT_MONTHS,
-                    "amount": self.base_package_amount(space),
+                    "amount": self.package_amount(space),
                     "serviceId": self.services[service],
                 }],
             },
@@ -542,17 +555,14 @@ class Importer:
         self.step("package", f"{space['room']} / {service}", "created")
         self.attach_package(room, space)
 
-    def base_package_amount(self, space: dict) -> float:
-        rent = space["rent"]
-        rate = excel_fx_rate(space)
-        if space.get("currency") == "USD" and rate:
-            return round(float(rent) * rate)
-        return rent
+    def package_amount(self, space: dict) -> float:
+        """Package.amount is the Excel unit price as-is (USD rows stay USD, never × Tỷ giá)."""
+        return float(space["rent"] or 0)
 
     def usd_alternative_amounts(self, space: dict) -> list[dict]:
         if space.get("currency") != "USD":
             return []
-        return [{"currency": "USD", "amount": space["rent"], "isAutoCalculated": False}]
+        return [{"currency": "USD", "amount": self.package_amount(space), "isAutoCalculated": False}]
 
     def package_input(self, item: dict, space: dict | None = None) -> dict:
         payload = {
@@ -563,6 +573,7 @@ class Importer:
         }
         alternatives = self.usd_alternative_amounts(space) if space else []
         if alternatives:
+            payload["amount"] = self.package_amount(space)
             payload["alternativeAmounts"] = alternatives
         return payload
 
@@ -585,13 +596,14 @@ class Importer:
         kept.append(self.package_input({
             "priceType": PRICE_TYPE_PER_ROOM,
             "unit": PACKAGE_UNIT_MONTHS,
-            "amount": self.base_package_amount(space),
+            "amount": self.package_amount(space),
             "serviceId": service_id,
         }, space))
         self.write_packages(room, kept)
         self.step("package", f"{space['room']} / {service}", "created")
 
     def stamp_usd_pricing(self, room: dict, space: dict):
+        """Rewrite package.amount to Excel USD and stamp alternativeAmounts (no VND conversion)."""
         service_id = self.services[space["service"]]
         kept = []
         for item in room["packages"]:
@@ -866,7 +878,8 @@ class Importer:
         start = booking["start"]
         end = booking["end"]
         duration = span_months(start, end) if mode == "full" else duration
-        first_end = min(add_months(start, duration) - timedelta(days=1), end)
+        # PMS "ngày thanh toán" has start+end; both take booking/period start (not kỳ end).
+        payment_day = start_of_day(start)
         customer_id = self.customers[self.customer_key(booking)]
         foreign = booking.get("currency") == "USD"
         payload = {
@@ -886,8 +899,8 @@ class Importer:
             "paymentSettings": {
                 "unit": PAYMENT_UNIT_MONTHS,
                 "duration": duration,
-                "firstPeriodPaymentStartDate": start_of_day(start),
-                "firstPeriodPaymentEndDate": end_of_day(first_end),
+                "firstPeriodPaymentStartDate": payment_day,
+                "firstPeriodPaymentEndDate": payment_day,
             },
         }
         if booking["note"]:
@@ -1044,7 +1057,8 @@ class Importer:
         return str(invoice.get("status") or "").lower() == "paid"
 
     def invoice_item_for_period(self, booking: dict, period: dict, period_id: str, amount: float) -> dict:
-        start, end = period["start"], period["end"]
+        # Both payment line dates use the same period start timestamp (not period end / end-of-day).
+        day = start_of_day(period["start"])
         building = booking["building"]
         room_id = next(
             (
@@ -1059,13 +1073,13 @@ class Importer:
         return {
             "category": graphql_enum("payment-period"),
             "name": i18n("Tiền thuê"),
-            "startTime": start_of_day(start),
-            "endTime": end_of_day(end),
+            "startTime": day,
+            "endTime": day,
             "quantity": 1,
             "timeQuantity": [{
                 "unit": graphql_enum("months"),
-                "startTime": start_of_day(start),
-                "endTime": end_of_day(end),
+                "startTime": day,
+                "endTime": day,
                 "quantity": 1,
                 "unitPrice": amount,
             }],
@@ -1123,8 +1137,14 @@ class Importer:
         building, customer_id, method,
     ):
         start = period["start"]
-        end = period["end"]
-        amount = float(stored_period["totalAmount"]) if stored_period and stored_period.get("totalAmount") else monthly * period["months"]
+        # VND: prefer PMS period total. USD: Excel rent × months, then × Tỷ giá → VND for invoice/payment.
+        if booking.get("currency") == "USD":
+            native = monthly * period["months"]
+        elif stored_period and stored_period.get("totalAmount") is not None:
+            native = float(stored_period["totalAmount"])
+        else:
+            native = monthly * period["months"]
+        amount = to_vnd_amount(booking, native)
         period_id = stored_period["id"] if stored_period else f"{booking_id}:period:{index}"
         invoice = existing.get(str(period_id))
         if invoice:
@@ -1140,20 +1160,15 @@ class Importer:
             "bookingId": booking_id,
             "invoiceItems": [self.invoice_item_for_period(booking, period, period_id, amount)],
         }
-        rates = usd_exchange_rates(booking)
-        if rates:
-            invoice_input["exchangeRates"] = rates
-            invoice_input["bookingExchangeRates"] = rates
+        day = start_of_day(start)
         payload = {
-            "issueDate": start_of_day(start),
-            "dueDate": end_of_day(end if end >= start else start),
+            "issueDate": day,
+            "dueDate": day,
             "saveAndConfirm": True,
             "isSingleInvoice": True,
             "locationId": self.locations[building],
             "invoices": [invoice_input],
         }
-        if rates:
-            payload["exchangeRates"] = rates
         invoices = self.client.mutate(
             self.urls["payment"],
             "createInvoices",

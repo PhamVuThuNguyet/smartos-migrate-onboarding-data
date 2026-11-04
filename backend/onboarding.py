@@ -259,8 +259,8 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
             fail("E04", key, f'Dòng {number}: cột "{LABELS[key]}" bắt buộc nhập')
 
     area = parse_number(raw["area"])
-    if not blank(raw["area"]) and not (area and area > 0):
-        fail("E05", "area", f"Dòng {number}: Diện tích phải là số lớn hơn 0")
+    if not blank(raw["area"]) and (area is None or area < 0):
+        fail("E05", "area", f"Dòng {number}: Diện tích phải là số không âm (PMS cho phép 0)")
     rent = parse_number(raw["rent"])
     if not blank(raw["rent"]) and not (rent and rent > 0):
         fail("E14", "rent", f'Dòng {number}: cột "{LABELS["rent"]}" phải là số lớn hơn 0')

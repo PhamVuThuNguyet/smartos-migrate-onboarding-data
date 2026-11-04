@@ -1,5 +1,6 @@
 """HTTP API for the preview UI. Next.js calls POST /preview, /import and /login."""
 
+import os
 from datetime import date
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -12,10 +13,21 @@ from identity import IdentityError, login, logout
 from import_api import SmartOSError, import_workbook, preview_workbook
 from onboarding import issue
 
+CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://201.79.109.197",
+    "https://201.79.109.197",
+]
+for origin in (os.environ.get("CORS_ORIGINS") or "").split(","):
+    origin = origin.strip()
+    if origin and origin not in CORS_ORIGINS:
+        CORS_ORIGINS.append(origin)
+
 app = FastAPI(title="SmartOS onboarding preview")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=CORS_ORIGINS,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
