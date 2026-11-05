@@ -9,7 +9,7 @@ import urllib.request
 
 IDENTITY_URL = os.environ.get(
     "SMARTOS_IDENTITY_URL",
-    "https://api-new-staging.smartos.space/identity-service/pms/graphql",
+    "https://api-new.smartos.space/identity-service/pms/graphql",
 )
 
 LOGIN_MUTATION = """
@@ -90,7 +90,7 @@ def api_base() -> str:
         return explicit
     if "/identity-service/" in IDENTITY_URL:
         return IDENTITY_URL.split("/identity-service/", 1)[0]
-    return "https://api-new-staging.smartos.space"
+    return "https://api-new.smartos.space"
 
 
 def service_graphql_url(service: str) -> str:
