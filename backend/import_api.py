@@ -95,7 +95,7 @@ def pms_issue_placement(message: str, booking: dict | None = None) -> tuple[str,
 
 
 def usd_exchange_rates(source: dict) -> list[dict]:
-    """createBooking exchangeRates from Excel Tỷ giá (room/booking only)."""
+    """createBooking/createInvoices exchangeRates from Excel Tỷ giá."""
     if source.get("currency") != "USD":
         return []
     rate = excel_fx_rate(source)
@@ -105,7 +105,7 @@ def usd_exchange_rates(source: dict) -> list[dict]:
 
 
 def to_vnd_amount(source: dict, amount: float) -> float:
-    """Invoice/payment amounts are always VND; USD rows × Excel Tỷ giá."""
+    """Payment transaction only: USD rows × Excel Tỷ giá → VND. Invoice stays native currency."""
     value = float(amount or 0)
     if source.get("currency") != "USD":
         return value
@@ -1137,29 +1137,35 @@ class Importer:
         building, customer_id, method,
     ):
         start = period["start"]
-        # VND: prefer PMS period total. USD: Excel rent × months, then × Tỷ giá → VND for invoice/payment.
+        # Invoice stays booking currency (USD rows keep USD). Payment transaction converts to VND.
         if booking.get("currency") == "USD":
-            native = monthly * period["months"]
+            invoice_amount = monthly * period["months"]
         elif stored_period and stored_period.get("totalAmount") is not None:
-            native = float(stored_period["totalAmount"])
+            invoice_amount = float(stored_period["totalAmount"])
         else:
-            native = monthly * period["months"]
-        amount = to_vnd_amount(booking, native)
+            invoice_amount = monthly * period["months"]
+        payment_amount = to_vnd_amount(booking, invoice_amount)
         period_id = stored_period["id"] if stored_period else f"{booking_id}:period:{index}"
         invoice = existing.get(str(period_id))
         if invoice:
             self.step("invoice", name, "reused", invoice["id"], invoice.get("code") or "")
-            if amount <= 0 or self.invoice_collected(invoice, amount):
-                if amount > 0:
+            if invoice_amount <= 0 or self.invoice_collected(invoice, invoice_amount):
+                if invoice_amount > 0:
                     self.step("transaction", name, "reused", invoice["id"])
                 return
-            self.collect_period(booking, booking_id, name, invoice["id"], amount, start, building, customer_id, method)
+            self.collect_period(
+                booking, booking_id, name, invoice["id"], payment_amount, start, building, customer_id, method,
+            )
             return
         invoice_input = {
             "type": graphql_enum("booking"),
             "bookingId": booking_id,
-            "invoiceItems": [self.invoice_item_for_period(booking, period, period_id, amount)],
+            "invoiceItems": [self.invoice_item_for_period(booking, period, period_id, invoice_amount)],
         }
+        rates = usd_exchange_rates(booking)
+        if rates:
+            invoice_input["exchangeRates"] = rates
+            invoice_input["bookingExchangeRates"] = rates
         day = start_of_day(start)
         payload = {
             "issueDate": day,
@@ -1169,6 +1175,8 @@ class Importer:
             "locationId": self.locations[building],
             "invoices": [invoice_input],
         }
+        if rates:
+            payload["exchangeRates"] = rates
         invoices = self.client.mutate(
             self.urls["payment"],
             "createInvoices",
@@ -1178,9 +1186,11 @@ class Importer:
         )
         invoice = invoices[0] if isinstance(invoices, list) else invoices
         self.step("invoice", name, "created", invoice["id"], invoice.get("code", ""))
-        if amount <= 0:
+        if invoice_amount <= 0:
             return
-        self.collect_period(booking, booking_id, name, invoice["id"], amount, start, building, customer_id, method)
+        self.collect_period(
+            booking, booking_id, name, invoice["id"], payment_amount, start, building, customer_id, method,
+        )
 
     def collect_period(self, booking, booking_id, name, invoice_id, amount, start, building, customer_id, method):
         payload = {
