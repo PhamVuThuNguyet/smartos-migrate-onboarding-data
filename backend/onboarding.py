@@ -336,23 +336,43 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
     return space, errors
 
 
+def booking_ranges_overlap(left: dict, right: dict) -> bool:
+    """True when both rows have dates and intervals overlap (edge-touch is OK)."""
+    start_a, end_a = left.get("start"), left.get("end")
+    start_b, end_b = right.get("start"), right.get("end")
+    if not start_a or not end_a or not start_b or not end_b:
+        return False
+    return start_a < end_b and end_a > start_b
+
+
 def duplicate_rooms(spaces: list[dict]) -> list[dict]:
-    """E11: a room name appears twice in one building."""
+    """E11: same room in one building with overlapping booking dates.
+
+    Same room on multiple rows is allowed when date ranges do not overlap
+    (or when a row has no booking dates — room-only rows).
+    """
     errors = []
-    seen: dict[tuple[str, str], int] = {}
+    by_room: dict[tuple[str, str], list[dict]] = {}
     for space in spaces:
         if not space["building"] or not space["room"]:
             continue
         key = (slug(space["building"]), slug(space["room"]))
-        if key in seen:
-            errors.append(issue(
-                "E11",
-                f'Dòng {space["row"]}: phòng "{space["room"]}" bị trùng với dòng {seen[key]}',
-                space["row"],
-                LABELS["room"],
-            ))
-        else:
-            seen[key] = space["row"]
+        by_room.setdefault(key, []).append(space)
+
+    for rows in by_room.values():
+        if len(rows) < 2:
+            continue
+        for index, current in enumerate(rows):
+            for other in rows[index + 1 :]:
+                if not booking_ranges_overlap(current, other):
+                    continue
+                errors.append(issue(
+                    "E11",
+                    f'Dòng {current["row"]}: phòng "{current["room"]}" trùng thời gian thuê với dòng {other["row"]} '
+                    f'({other["start"].isoformat()} → {other["end"].isoformat()})',
+                    current["row"],
+                    LABELS["room"],
+                ))
     return errors
 
 
