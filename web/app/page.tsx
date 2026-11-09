@@ -51,6 +51,21 @@ type PreviewResponse = {
   refreshToken?: string;
 };
 
+type ImportJob = {
+  id: string;
+  status: string;
+  phase?: string;
+  message?: string;
+  filename?: string;
+  totalBookings?: number;
+  doneBookings?: number;
+  percent?: number;
+  completedKeys?: string[];
+  recentSteps?: ImportStep[];
+  error?: string;
+  result?: PreviewResponse | null;
+};
+
 type Me = {
   id?: string;
   accountId?: string;
@@ -217,8 +232,10 @@ export default function HomePage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [importing, setImporting] = useState(false);
+  const [importJob, setImportJob] = useState<ImportJob | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const pendingImport = useRef(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const groups = useMemo(() => {
     const map = new Map<string, ApiCall[]>();
@@ -263,6 +280,86 @@ export default function HomePage() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [payloadCall, loginOpen, confirmOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, []);
+
+  function stopPolling() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }
+
+  function applyImportResult(data: PreviewResponse, current: Session) {
+    setPreview(data);
+    setSelectedMutation(data.calls[0]?.mutation ?? "");
+    setQuery("");
+    if (data.accessToken) {
+      const next: Session = {
+        domain: current.domain,
+        accessToken: data.accessToken,
+        refreshToken: data.refreshToken || current.refreshToken,
+        me: current.me,
+      };
+      localStorage.setItem(SESSION_KEY, JSON.stringify(next));
+      setSession(next);
+    }
+    if (data.error) setError(data.error);
+  }
+
+  async function pollJob(jobId: string, current: Session) {
+    stopPolling();
+    const tick = async () => {
+      try {
+        const response = await fetch(apiUrl(`jobs/${jobId}`));
+        const job = (await readApiJson(response)) as ImportJob & { detail?: string };
+        if (!response.ok) {
+          throw new Error(job.detail || "Không đọc được tiến độ job");
+        }
+        setImportJob(job);
+        if (job.status === "done") {
+          stopPolling();
+          setImporting(false);
+          if (job.result) applyImportResult(job.result, current);
+          return;
+        }
+        if (job.status === "error") {
+          stopPolling();
+          setImporting(false);
+          setError(job.error || "Import lỗi");
+          if (job.result) applyImportResult(job.result, current);
+        }
+      } catch (caught) {
+        stopPolling();
+        setImporting(false);
+        setError(explainFetchFailure(caught, "Mất kết nối khi theo dõi job"));
+      }
+    };
+    await tick();
+    pollRef.current = setInterval(tick, 1500);
+  }
+
+  async function onResumeJob() {
+    if (!importJob?.id || !session) return;
+    setImporting(true);
+    setError("");
+    try {
+      const response = await fetch(apiUrl(`jobs/${importJob.id}/resume`), { method: "POST" });
+      const job = (await readApiJson(response)) as ImportJob & { detail?: string };
+      if (!response.ok) {
+        throw new Error(job.detail || "Không resume được job");
+      }
+      setImportJob(job);
+      await pollJob(importJob.id, session);
+    } catch (caught) {
+      setImporting(false);
+      setError(explainFetchFailure(caught, "Không resume được job"));
+    }
+  }
 
   async function onLogin(event: React.FormEvent) {
     event.preventDefault();
@@ -384,6 +481,7 @@ export default function HomePage() {
     setConfirmOpen(false);
     setImporting(true);
     setError("");
+    setImportJob(null);
     try {
       const body = new FormData();
       body.append("file", file);
@@ -391,28 +489,29 @@ export default function HomePage() {
       body.append("accessToken", session.accessToken);
       body.append("refreshToken", session.refreshToken || "");
       const response = await fetch(apiUrl("import"), { method: "POST", body });
-      const payload = (await readApiJson(response)) as { detail?: string };
+      const payload = (await readApiJson(response)) as {
+        detail?: string;
+        jobId?: string;
+        async?: boolean;
+      } & Partial<PreviewResponse>;
       if (!response.ok) {
         throw new Error(payload.detail || "Không ghi được dữ liệu");
       }
-      const data = payload as PreviewResponse;
-      setPreview(data);
-      setSelectedMutation(data.calls[0]?.mutation ?? "");
-      setQuery("");
-      if (data.accessToken) {
-        const next: Session = {
-          domain: session.domain,
-          accessToken: data.accessToken,
-          refreshToken: data.refreshToken || session.refreshToken,
-          me: session.me,
-        };
-        localStorage.setItem(SESSION_KEY, JSON.stringify(next));
-        setSession(next);
+      if (payload.jobId) {
+        setImportJob({
+          id: payload.jobId,
+          status: "queued",
+          message: "Đã xếp hàng",
+          percent: 0,
+        });
+        await pollJob(payload.jobId, session);
+        return;
       }
-      if (data.error) setError(data.error);
+      // Legacy sync response
+      applyImportResult(payload as PreviewResponse, session);
+      setImporting(false);
     } catch (caught) {
       setError(explainFetchFailure(caught, "Không ghi được dữ liệu"));
-    } finally {
       setImporting(false);
     }
   }
@@ -574,6 +673,25 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
           {importing ? "Upserting..." : "Upsert"}
         </button>
       </form>
+      {importJob && (importing || importJob.status === "error" || importJob.status === "running") ? (
+        <section className="panel summary">
+          <span>
+            Job <strong>{importJob.id.slice(0, 8)}</strong> — {importJob.status}
+          </span>
+          <span>
+            <strong>{importJob.percent ?? 0}%</strong>
+            {importJob.totalBookings
+              ? ` (${importJob.doneBookings ?? 0}/${importJob.totalBookings} booking)`
+              : ""}
+          </span>
+          <span>{importJob.message || importJob.phase || ""}</span>
+          {importJob.status === "error" ? (
+            <button type="button" className="download" onClick={onResumeJob} disabled={importing}>
+              Resume từ checkpoint
+            </button>
+          ) : null}
+        </section>
+      ) : null}
       {error ? <p className="error">{error}</p> : null}
 
       {preview ? (

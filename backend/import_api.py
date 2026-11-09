@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import base64
 import re
+import threading
 import unicodedata
 from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Callable
 
 from identity import IdentityError, graphql, namespace_of, refresh_tokens, service_graphql_url
 from onboarding import (
@@ -19,6 +22,9 @@ from onboarding import (
     read_onboarding,
     slug,
 )
+
+# Parallel createInvoices for elapsed periods (each call still one issueDate).
+INVOICE_WORKERS = 5
 
 PMS_ERROR = "E16"
 
@@ -178,7 +184,7 @@ def add_months(day: date, months: int) -> date:
 
 
 def cycle_periods(start: date, end: date, step_months: int) -> list[dict]:
-    """Billing periods anchored on the contract start day."""
+    """Billing periods anchored on the contract start day (PMS MonthlyCalculationType.Cycle)."""
     if end <= start:
         end = start + timedelta(days=1)
     step = max(1, step_months)
@@ -205,6 +211,57 @@ def cycle_periods(start: date, end: date, step_months: int) -> list[dict]:
             break
         index += 1
     return periods
+
+
+def calendar_periods(start: date, end: date, step_months: int) -> list[dict]:
+    """Billing periods aligned to calendar months (PMS MonthlyCalculationType.Calendar).
+
+    Example start 24/1, step 1: 24/1–31/1, 1/2–28/2, 1/3–31/3, …
+    Matches payment-period.service calculatePeriodTimeRange for Calendar + MONTHS.
+    """
+    if end <= start:
+        end = start + timedelta(days=1)
+    step = max(1, step_months)
+    periods = []
+    anchor_month = date(start.year, start.month, 1)
+    index = 0
+    guard = 0
+    while guard < 600:
+        guard += 1
+        raw_start = add_months(anchor_month, index * step)
+        # scheduleAnchor.add((idx+1)*step, month).subtract(1, month).endOf('month')
+        end_marker = add_months(add_months(start, (index + 1) * step), -1)
+        raw_end = date(
+            end_marker.year,
+            end_marker.month,
+            monthrange(end_marker.year, end_marker.month)[1],
+        )
+        if raw_start > end:
+            break
+        period_start = max(raw_start, start)
+        period_end = min(raw_end, end)
+        if period_start <= period_end:
+            full = period_start == raw_start and period_end == raw_end
+            periods.append({
+                "start": period_start,
+                "end": period_end,
+                "months": step if full else _covered_months(period_start, period_end),
+            })
+        if raw_end >= end:
+            break
+        index += 1
+    return periods
+
+
+def booking_periods(
+    start: date,
+    end: date,
+    step_months: int,
+    monthly_calc: str | None = "Cycle",
+) -> list[dict]:
+    if str(monthly_calc or "Cycle").strip().lower() == "calendar":
+        return calendar_periods(start, end, step_months)
+    return cycle_periods(start, end, step_months)
 
 
 def elapsed_pms_periods(stored: list, booking_start: date, booking_end: date, as_of: date) -> list[tuple[dict, dict]]:
@@ -253,11 +310,13 @@ class Importer:
         self.transfer_methods: dict[str, str] = {}
         self.contract_templates: dict[str, str] = {}
         self.booked_rooms: set[tuple[str, str]] = set()
+        self.tax_flags: dict[str, bool] = {}
+        self._state_lock = threading.Lock()
 
     def step(self, action: str, name: str, status: str, record_id: str = "", detail: str = ""):
-        self.steps.append(
-            {"action": action, "name": name, "status": status, "id": record_id, "detail": detail}
-        )
+        item = {"action": action, "name": name, "status": status, "id": record_id, "detail": detail}
+        with self._state_lock:
+            self.steps.append(item)
 
     def record_issue(
         self,
@@ -268,8 +327,30 @@ class Importer:
         name: str = "",
         code: str = PMS_ERROR,
     ):
-        self.issues.append(issue(code, message, row, column))
+        with self._state_lock:
+            self.issues.append(issue(code, message, row, column))
         self.step(action, name or (f"dòng {row}" if row else "lỗi"), "error", detail=message)
+
+    def booking_resume_key(self, booking: dict) -> str:
+        mode, duration = booking.get("cycle") or ("months", 1)
+        return "|".join(
+            [
+                self.customer_key(booking) if booking.get("name") else "",
+                str(booking.get("building") or ""),
+                str(booking.get("start") or ""),
+                str(booking.get("end") or ""),
+                str(booking.get("currency") or ""),
+                f"{mode}:{duration}",
+                str(booking.get("monthly_calc") or "Cycle"),
+            ]
+        )
+
+    def booking_has_issue(self, booking: dict) -> bool:
+        rows = {row for row in (booking.get("rows") or []) if row is not None}
+        if not rows:
+            return False
+        with self._state_lock:
+            return any(item.get("row") in rows for item in self.issues)
 
     def record_booking_issue(self, booking: dict, error, action: str = "booking"):
         column, detail = pms_issue_placement(str(error), booking)
@@ -303,29 +384,82 @@ class Importer:
             if key in self.rooms:
                 self.booked_rooms.add(key)
 
-    def run(self, as_of: date, spaces: list[dict], bookings: list[dict]) -> dict:
+    def run(
+        self,
+        as_of: date,
+        spaces: list[dict],
+        bookings: list[dict],
+        *,
+        skip_booking_keys: set[str] | None = None,
+        on_progress: Callable[[dict], None] | None = None,
+    ) -> dict:
+        skip = set(skip_booking_keys or ())
+        completed: list[str] = []
+        ordered = sorted(bookings, key=lambda item: not item["main"])
+        total = len(ordered)
+        processed = 0
+
+        def emit(phase: str, message: str, done: int | None = None):
+            if not on_progress:
+                return
+            payload = {
+                "phase": phase,
+                "message": message,
+                "totalBookings": total,
+                "doneBookings": done if done is not None else processed,
+                "completedKeys": list(completed),
+                "recentSteps": list(self.steps[-40:]),
+            }
+            on_progress(payload)
+
+        emit("catalog", "Đang resolve location / service", 0)
         self.resolve_catalog(spaces)
+        emit("rooms", "Đang tạo / reuse phòng", 0)
         self.ensure_floors_and_rooms(spaces)
-        for booking in sorted(bookings, key=lambda item: not item["main"]):
+
+        for booking in ordered:
+            key = self.booking_resume_key(booking)
+            name = booking["name"]
+            if key in skip:
+                self.step("booking", name, "reused", detail="checkpoint skip")
+                if key not in completed:
+                    completed.append(key)
+                processed += 1
+                emit("bookings", f"Bỏ qua (đã xong): {name}", processed)
+                continue
             try:
                 if self.skip_invalid_email(booking):
+                    # Permanent skip — do not retry on resume
+                    completed.append(key)
+                    processed += 1
+                    emit("bookings", f"Bỏ qua email: {name}", processed)
                     continue
                 if booking["building"] not in self.locations:
                     self.step(
                         "booking",
-                        booking["name"],
+                        name,
                         "skipped",
                         detail=f'Tòa "{booking["building"]}" chưa có trên hệ thống',
                     )
+                    processed += 1
+                    emit("bookings", f"Bỏ qua tòa: {name}", processed)
                     continue
+                emit("bookings", f"Đang xử lý: {name}", processed)
                 self.ensure_customer(booking)
                 self.ensure_booking(as_of, booking)
             except SmartOSError as caught:
                 self.record_booking_issue(booking, caught)
             except Exception as caught:
                 self.record_booking_issue(booking, caught)
+            # Only checkpoint successful bookings so resume retries PMS/invoice failures.
+            if not self.booking_has_issue(booking):
+                completed.append(key)
+            processed += 1
+            emit("bookings", f"Xong: {name}", processed)
+
         self.issues.sort(key=lambda item: (item.get("row") is None, item.get("row") or 0, item.get("code") or ""))
-        return {"steps": self.steps, "error": ""}
+        emit("finishing", "Hoàn tất", total)
+        return {"steps": self.steps, "error": "", "completedKeys": completed}
 
     def resolve_catalog(self, spaces: list[dict]):
         for name in dict.fromkeys(space["building"] for space in spaces):
@@ -856,6 +990,27 @@ class Importer:
             except (SmartOSError, Exception) as caught:
                 self.record_booking_issue(booking, caught, "completeBooking")
 
+    def location_apply_tax(self, location_id: str) -> bool:
+        """Mirror PMS customer create: applyTax from bookingPolicy.isTaxApplied."""
+        with self._state_lock:
+            if location_id in self.tax_flags:
+                return self.tax_flags[location_id]
+        flag = False
+        graphql_fn = getattr(self.client, "graphql", None)
+        if callable(graphql_fn):
+            try:
+                data = graphql_fn(
+                    self.urls["reservation"],
+                    "query($locationId: ObjectID!) { bookingPolicy(locationId: $locationId) { isTaxApplied } }",
+                    {"locationId": location_id},
+                )
+                flag = bool((data.get("bookingPolicy") or {}).get("isTaxApplied"))
+            except Exception:
+                flag = False
+        with self._state_lock:
+            self.tax_flags[location_id] = flag
+        return flag
+
     def create_booking(self, booking: dict, ready: list, name: str) -> str:
         building = booking["building"]
         rooms: dict[str, dict] = {}
@@ -878,22 +1033,24 @@ class Importer:
         start = booking["start"]
         end = booking["end"]
         duration = span_months(start, end) if mode == "full" else duration
+        monthly_calc = booking.get("monthly_calc") or "Cycle"
+        location_id = self.locations[building]
         # PMS "ngày thanh toán" has start+end; both take booking/period start (not kỳ end).
         payment_day = start_of_day(start)
         customer_id = self.customers[self.customer_key(booking)]
         foreign = booking.get("currency") == "USD"
         payload = {
-            "locationId": self.locations[building],
+            "locationId": location_id,
             "rooms": list(rooms.values()),
             "customerIds": [customer_id],
             "primaryCustomerId": customer_id,
             "startTime": start_of_day(start),
             "endTime": end_of_day(end),
             "selectTime": False,
-            "monthlyCalculationType": "Cycle",
+            "monthlyCalculationType": monthly_calc,
             "daysOfMonthCalculationType": "DaysOfCalendar",
             "numberOfPeople": 1,
-            "applyTax": False,
+            "applyTax": self.location_apply_tax(location_id),
             "currency": "USD" if foreign else "VND",
             "markAsConfirmed": True,
             "paymentSettings": {
@@ -1090,7 +1247,7 @@ class Importer:
             "metadata": {
                 "roomId": room_id,
                 "packageUnit": graphql_enum("months"),
-                "monthlyCalculationType": "Cycle",
+                "monthlyCalculationType": booking.get("monthly_calc") or "Cycle",
                 "daysOfMonthCalculationType": "DaysOfCalendar",
             },
         }
@@ -1113,7 +1270,7 @@ class Importer:
             step = span_months(start, end) if mode == "full" else duration
             due = [
                 (period, None)
-                for period in cycle_periods(start, end, step)
+                for period in booking_periods(start, end, step, booking.get("monthly_calc"))
                 if period["end"] < as_of
             ]
         if not due:
@@ -1123,21 +1280,66 @@ class Importer:
         building = booking["building"]
         customer_id = self.customers[self.customer_key(booking)]
         method = self.transfer_method_id(self.locations[building])
+
+        to_create: list[dict] = []
         for index, (period, stored_period) in enumerate(due, start=1):
             try:
-                self._upsert_period_invoice(
-                    booking, booking_id, name, period, index, stored_period, existing, monthly,
-                    building, customer_id, method,
+                plan = self._period_invoice_plan(
+                    booking, booking_id, period, index, stored_period, existing, monthly,
+                )
+                if plan["existing"]:
+                    invoice = plan["existing"]
+                    self.step("invoice", name, "reused", invoice["id"], invoice.get("code") or "")
+                    if plan["invoice_amount"] <= 0 or self.invoice_collected(invoice, plan["invoice_amount"]):
+                        if plan["invoice_amount"] > 0:
+                            self.step("transaction", name, "reused", invoice["id"])
+                        continue
+                    self.collect_period(
+                        booking, booking_id, name, invoice["id"], plan["payment_amount"],
+                        plan["start"], building, customer_id, method,
+                    )
+                    continue
+                to_create.append(plan)
+            except (SmartOSError, Exception) as caught:
+                self.record_booking_issue(booking, caught, "invoice")
+
+        created_pays: list[dict] = []
+        if to_create:
+            workers = min(INVOICE_WORKERS, len(to_create))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        self._create_period_invoice,
+                        booking, booking_id, name, plan, building,
+                    ): plan
+                    for plan in to_create
+                }
+                for future in as_completed(futures):
+                    plan = futures[future]
+                    try:
+                        invoice = future.result()
+                        if plan["invoice_amount"] > 0 and invoice:
+                            created_pays.append({
+                                "invoice_id": invoice["id"],
+                                "payment_amount": plan["payment_amount"],
+                                "start": plan["start"],
+                            })
+                    except (SmartOSError, Exception) as caught:
+                        self.record_booking_issue(booking, caught, "invoice")
+
+        for pay in created_pays:
+            try:
+                self.collect_period(
+                    booking, booking_id, name, pay["invoice_id"], pay["payment_amount"],
+                    pay["start"], building, customer_id, method,
                 )
             except (SmartOSError, Exception) as caught:
                 self.record_booking_issue(booking, caught, "invoice")
 
-    def _upsert_period_invoice(
-        self, booking, booking_id, name, period, index, stored_period, existing, monthly,
-        building, customer_id, method,
-    ):
+    def _period_invoice_plan(
+        self, booking, booking_id, period, index, stored_period, existing, monthly,
+    ) -> dict:
         start = period["start"]
-        # Invoice stays booking currency (USD rows keep USD). Payment transaction converts to VND.
         if booking.get("currency") == "USD":
             invoice_amount = monthly * period["months"]
         elif stored_period and stored_period.get("totalAmount") is not None:
@@ -1146,17 +1348,21 @@ class Importer:
             invoice_amount = monthly * period["months"]
         payment_amount = to_vnd_amount(booking, invoice_amount)
         period_id = stored_period["id"] if stored_period else f"{booking_id}:period:{index}"
-        invoice = existing.get(str(period_id))
-        if invoice:
-            self.step("invoice", name, "reused", invoice["id"], invoice.get("code") or "")
-            if invoice_amount <= 0 or self.invoice_collected(invoice, invoice_amount):
-                if invoice_amount > 0:
-                    self.step("transaction", name, "reused", invoice["id"])
-                return
-            self.collect_period(
-                booking, booking_id, name, invoice["id"], payment_amount, start, building, customer_id, method,
-            )
-            return
+        return {
+            "period": period,
+            "period_id": period_id,
+            "start": start,
+            "invoice_amount": invoice_amount,
+            "payment_amount": payment_amount,
+            "existing": existing.get(str(period_id)),
+        }
+
+    def _create_period_invoice(self, booking, booking_id, name, plan: dict, building: str) -> dict:
+        """createInvoices for one period (issueDate is command-level → one call per period date)."""
+        period = plan["period"]
+        invoice_amount = plan["invoice_amount"]
+        period_id = plan["period_id"]
+        start = plan["start"]
         invoice_input = {
             "type": graphql_enum("booking"),
             "bookingId": booking_id,
@@ -1186,11 +1392,7 @@ class Importer:
         )
         invoice = invoices[0] if isinstance(invoices, list) else invoices
         self.step("invoice", name, "created", invoice["id"], invoice.get("code", ""))
-        if invoice_amount <= 0:
-            return
-        self.collect_period(
-            booking, booking_id, name, invoice["id"], payment_amount, start, building, customer_id, method,
-        )
+        return invoice
 
     def collect_period(self, booking, booking_id, name, invoice_id, amount, start, building, customer_id, method):
         payload = {
@@ -1297,6 +1499,7 @@ class PreviewClient:
         duration = int((booking.get("paymentSettings") or {}).get("duration") or 1)
         if not start or not end:
             return []
+        monthly_calc = booking.get("monthlyCalculationType") or "Cycle"
         return [
             {
                 "id": f"{booking_id}:period:{index}",
@@ -1304,7 +1507,10 @@ class PreviewClient:
                 "startDate": start_of_day(period["start"]),
                 "endDate": end_of_day(period["end"]),
             }
-            for index, period in enumerate(cycle_periods(start, end, duration), start=1)
+            for index, period in enumerate(
+                booking_periods(start, end, duration, monthly_calc),
+                start=1,
+            )
         ]
 
     def mutate(self, url: str, field: str, input_type: str, selection: str, payload: dict):
@@ -1456,6 +1662,7 @@ class LiveClient:
         self.access_token = access_token
         self.refresh_token = refresh_token
         self.calls: list[dict] = []
+        self._lock = threading.Lock()
 
     def refresh_if_possible(self):
         if not self.refresh_token:
@@ -1469,10 +1676,15 @@ class LiveClient:
 
     def graphql(self, url: str, query: str, variables: dict | None = None, retry: bool = True) -> dict:
         try:
-            return graphql(query, variables, self.namespace, self.access_token, url=url, timeout=60)
+            with self._lock:
+                token = self.access_token
+                refresh = self.refresh_token
+                ns = self.namespace
+            return graphql(query, variables, ns, token, url=url, timeout=60)
         except IdentityError as error:
-            if retry and self.refresh_token and (error.status_code == 401 or error.code == "SESSION_EXPIRED"):
-                self.refresh_if_possible()
+            if retry and refresh and (error.status_code == 401 or error.code == "SESSION_EXPIRED"):
+                with self._lock:
+                    self.refresh_if_possible()
                 return self.graphql(url, query, variables, retry=False)
             raise SmartOSError(str(error)) from error
 
@@ -1550,26 +1762,28 @@ class LiveClient:
             )
         except SmartOSError as error:
             raise SmartOSError(f"{error} [{field}]") from error
-        self.calls.append({
-            "mutation": field,
-            "service": url,
-            "inputType": input_type,
-            "title": call_title(field, payload),
-            "input": payload,
-            "apiFills": API_FILLS.get(field, ["id"]),
-        })
+        with self._lock:
+            self.calls.append({
+                "mutation": field,
+                "service": url,
+                "inputType": input_type,
+                "title": call_title(field, payload),
+                "input": payload,
+                "apiFills": API_FILLS.get(field, ["id"]),
+            })
         return data.get(field)
 
     def call(self, url: str, query: str, variables: dict | None = None) -> dict:
         data = self.graphql(url, query, variables)
-        self.calls.append({
-            "mutation": "completeBooking",
-            "service": url,
-            "inputType": "id",
-            "title": (variables or {}).get("id", ""),
-            "input": variables or {},
-            "apiFills": [],
-        })
+        with self._lock:
+            self.calls.append({
+                "mutation": "completeBooking",
+                "service": url,
+                "inputType": "id",
+                "title": (variables or {}).get("id", ""),
+                "input": variables or {},
+                "apiFills": [],
+            })
         return data
 
 
@@ -1651,7 +1865,15 @@ def _rows_from_list(result) -> list:
     return []
 
 
-def import_workbook(path, domain: str, access_token: str, refresh_token: str = "") -> dict:
+def import_workbook(
+    path,
+    domain: str,
+    access_token: str,
+    refresh_token: str = "",
+    *,
+    skip_booking_keys: set[str] | None = None,
+    on_progress: Callable[[dict], None] | None = None,
+) -> dict:
     data = read_onboarding(path)
     as_of = data["asOf"]
     if data["errors"]:
@@ -1666,7 +1888,13 @@ def import_workbook(path, domain: str, access_token: str, refresh_token: str = "
         for key in ("property", "customer", "reservation", "payment", "contract")
     }
     importer = Importer(client, urls, {"paymentMethodId": ""})
-    result = importer.run(as_of, data["spaces"], data["bookings"])
+    result = importer.run(
+        as_of,
+        data["spaces"],
+        data["bookings"],
+        skip_booking_keys=skip_booking_keys,
+        on_progress=on_progress,
+    )
     payload = _workbook_result(
         as_of,
         importer.issues,
@@ -1680,4 +1908,83 @@ def import_workbook(path, domain: str, access_token: str, refresh_token: str = "
     )
     payload["accessToken"] = client.access_token
     payload["refreshToken"] = client.refresh_token
+    payload["completedKeys"] = result.get("completedKeys") or []
     return payload
+
+
+def run_import_job(job_id: str) -> None:
+    """Background worker entry: load job, import with checkpoint progress."""
+    from jobs import cleanup_workbook, load_job, public_job, save_job, update_progress, workbook_path
+
+    job = load_job(job_id)
+    if not job:
+        return
+    path = workbook_path(job_id)
+    if not path.exists():
+        update_progress(job_id, status="error", phase="error", error="Không tìm thấy file job", message="Lỗi")
+        return
+
+    skip = set(job.get("completedKeys") or [])
+    update_progress(
+        job_id,
+        status="running",
+        phase="starting",
+        message="Bắt đầu import",
+        error="",
+    )
+
+    def on_progress(info: dict):
+        update_progress(
+            job_id,
+            status="running",
+            phase=info.get("phase"),
+            message=info.get("message"),
+            total_bookings=info.get("totalBookings"),
+            done_bookings=info.get("doneBookings"),
+            completed_keys=info.get("completedKeys"),
+            recent_steps=info.get("recentSteps"),
+        )
+
+    try:
+        result = import_workbook(
+            path,
+            job["domain"],
+            job["accessToken"],
+            job.get("refreshToken") or "",
+            skip_booking_keys=skip,
+            on_progress=on_progress,
+        )
+        # Persist refreshed tokens for resume
+        job = load_job(job_id) or job
+        if result.get("accessToken"):
+            job["accessToken"] = result["accessToken"]
+        if result.get("refreshToken"):
+            job["refreshToken"] = result["refreshToken"]
+        job["completedKeys"] = result.get("completedKeys") or job.get("completedKeys") or []
+        save_job(job)
+        # Drop heavy call list from stored result if huge — keep for UI but cap
+        stored = dict(result)
+        calls = stored.get("calls") or []
+        if len(calls) > 500:
+            stored["calls"] = calls[-500:]
+            stored["callsTruncated"] = True
+        update_progress(
+            job_id,
+            status="done",
+            phase="done",
+            message="Import xong",
+            percent=100,
+            done_bookings=job.get("totalBookings") or len(job.get("completedKeys") or []),
+            completed_keys=job.get("completedKeys"),
+            result=stored,
+            error="",
+        )
+        cleanup_workbook(job_id)
+    except Exception as caught:
+        update_progress(
+            job_id,
+            status="error",
+            phase="error",
+            message="Import lỗi",
+            error=str(caught),
+        )

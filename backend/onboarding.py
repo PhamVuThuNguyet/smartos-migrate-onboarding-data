@@ -28,6 +28,7 @@ COLUMNS = (
     ("end", "Ngày kết thúc"),
     ("deposit", "Tiền cọc"),
     ("cycle", "Kỳ thanh toán"),
+    ("monthly_calc", "Cách tính chu kỳ"),
     ("contract_no", "Số hợp đồng"),
     ("template", "Mẫu hợp đồng"),
     ("note", "Ghi chú đặt chỗ"),
@@ -140,6 +141,18 @@ def parse_cycle(value) -> tuple[str, int | None] | None:
     if "thang" in tokens or re.fullmatch(r"\d+", raw.strip()):
         return "months", count
     return None
+
+
+def parse_monthly_calc(value) -> str | None:
+    """Return Calendar or Cycle. None when blank; '' sentinel not used — unknown → Falsey via caller."""
+    if blank(value):
+        return None
+    key = slug(str(value))
+    if key in {"calendar", "lich", "lich-thang"}:
+        return "Calendar"
+    if key in {"cycle", "chu-ky"}:
+        return "Cycle"
+    return ""
 
 
 def split_emails(value) -> list[str]:
@@ -295,7 +308,7 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
         return space, errors
 
     name = space["name"]
-    missing = [key for key in ("start", "end", "cycle") if blank(raw[key])]
+    missing = [key for key in ("start", "end", "cycle", "monthly_calc") if blank(raw[key])]
     if missing:
         columns = ", ".join(f'"{LABELS[key]}"' for key in missing)
         fail("E09", missing[0], f'Dòng {number}: thiếu thông tin thuê của khách "{name}" (cột {columns})')
@@ -314,6 +327,13 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
             f'Dòng {number}: cột "Kỳ thanh toán" không đọc được, dùng Hàng tháng, 3 tháng, Hàng quý, '
             "2 quý, nửa năm, Hàng năm hoặc Đã thanh toán toàn bộ",
         )
+    monthly_calc = parse_monthly_calc(raw["monthly_calc"])
+    if not blank(raw["monthly_calc"]) and monthly_calc == "":
+        fail(
+            "E14",
+            "monthly_calc",
+            f'Dòng {number}: cột "Cách tính chu kỳ" chỉ nhận Calendar hoặc Cycle',
+        )
     deposit = 0.0 if blank(raw["deposit"]) else parse_number(raw["deposit"])
     if deposit is None or deposit < 0:
         fail("E14", "deposit", f'Dòng {number}: cột "Tiền cọc" phải là số không âm')
@@ -327,6 +347,7 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
         "start": start,
         "end": end,
         "cycle": cycle,
+        "monthly_calc": monthly_calc or "Cycle",
         "deposit": deposit or 0.0,
         "contract_no": text(raw["contract_no"]),
         "template": text(raw["template"]),
@@ -381,7 +402,7 @@ def customer_of(space: dict) -> tuple[str, str | None]:
 
 
 def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
-    """One booking per customer, dates, building, cycle, and currency."""
+    """One booking per customer, dates, building, cycle, monthly calc, and currency."""
     groups: dict[tuple, list[dict]] = {}
     for space in spaces:
         if not space["name"]:
@@ -392,6 +413,7 @@ def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
             space["start"],
             space["end"],
             space["cycle"],
+            space.get("monthly_calc") or "Cycle",
             space["currency"],
         )
         groups.setdefault(key, []).append(space)
@@ -420,6 +442,7 @@ def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
             "start": first["start"],
             "end": first["end"],
             "cycle": first["cycle"],
+            "monthly_calc": first.get("monthly_calc") or "Cycle",
             "currency": first["currency"],
             "fx": first["fx"],
             "deposit": first["deposit"],

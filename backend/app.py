@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from identity import IdentityError, login, logout
-from import_api import SmartOSError, import_workbook, preview_workbook
+from import_api import SmartOSError, import_workbook, preview_workbook, run_import_job
+from jobs import create_job, load_job, public_job, start_worker, update_progress
 from onboarding import issue
 
 CORS_ORIGINS = [
@@ -111,18 +112,63 @@ async def import_records(
     domain: str = Form(""),
     accessToken: str = Form(""),
     refreshToken: str = Form(""),
+    sync: str = Form(""),
 ):
+    """Start background import job (default). Pass sync=1 for legacy blocking import."""
     if not domain.strip() or not accessToken.strip():
         raise HTTPException(status_code=401, detail="Cần đăng nhập trước khi ghi dữ liệu")
     content = await file.read()
     if not (file.filename or "").lower().endswith(".xlsx") or not content:
         return rejected_file()
-    path = save_upload(file, content)
-    try:
-        return import_workbook(path, domain, accessToken, refreshToken)
-    except SmartOSError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except Exception as error:
-        raise HTTPException(status_code=400, detail=f"Không ghi được dữ liệu: {error}") from error
-    finally:
-        path.unlink(missing_ok=True)
+
+    if str(sync).strip() in {"1", "true", "yes"}:
+        path = save_upload(file, content)
+        try:
+            return import_workbook(path, domain, accessToken, refreshToken)
+        except SmartOSError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(status_code=400, detail=f"Không ghi được dữ liệu: {error}") from error
+        finally:
+            path.unlink(missing_ok=True)
+
+    job = create_job(
+        domain=domain.strip(),
+        access_token=accessToken.strip(),
+        refresh_token=(refreshToken or "").strip(),
+        filename=file.filename or "import.xlsx",
+        content=content,
+    )
+    start_worker(job["id"], run_import_job)
+    return {"jobId": job["id"], "status": job["status"], "async": True}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job")
+    return public_job(job)
+
+
+@app.post("/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    """Resume a failed/interrupted job from completedKeys checkpoint."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Không tìm thấy job")
+    if job.get("status") == "running":
+        return public_job(job)
+    if job.get("status") == "done":
+        return public_job(job)
+    from jobs import workbook_path
+
+    if not workbook_path(job_id).exists():
+        raise HTTPException(
+            status_code=400,
+            detail="File job đã bị xóa — upload lại để import. Checkpoint chỉ dùng khi file còn trên server.",
+        )
+    update_progress(job_id, status="queued", phase="queued", message="Resume từ checkpoint", error="")
+    start_worker(job_id, run_import_job)
+    job = load_job(job_id)
+    return public_job(job or {})
