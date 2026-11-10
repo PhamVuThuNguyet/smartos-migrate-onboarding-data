@@ -123,6 +123,14 @@ def to_vnd_amount(source: dict, amount: float) -> float:
     return round(value * rate)
 
 
+def payment_transaction_amount(source: dict, amount: float, apply_tax: bool) -> float:
+    """VND payment for a period. Booking applyTax adds 10% after FX. Deposit is not included."""
+    value = to_vnd_amount(source, amount)
+    if not apply_tax:
+        return value
+    return round(value * 1.1)
+
+
 def _as_iso(moment: datetime) -> str:
     utc = moment.astimezone(UTC)
     millis = utc.microsecond // 1000
@@ -874,7 +882,7 @@ class Importer:
             self.urls["reservation"],
             "bookings",
             "BookingQueryInput",
-            "id code status startTime endTime roomIds",
+            "id code status startTime endTime roomIds applyTax",
             {
                 "locationId": {"eq": self.locations[booking["building"]]},
                 "primaryCustomerId": {"eq": self.customers[self.customer_key(booking)]},
@@ -961,6 +969,7 @@ class Importer:
         if existing:
             self.step("booking", name, "reused", existing["id"])
             booking_id = existing["id"]
+            booking["apply_tax"] = bool(existing.get("applyTax"))
         else:
             clash = self.overlapping_booking(booking, ready)
             if clash:
@@ -1035,6 +1044,8 @@ class Importer:
         duration = span_months(start, end) if mode == "full" else duration
         monthly_calc = booking.get("monthly_calc") or "Cycle"
         location_id = self.locations[building]
+        apply_tax = self.location_apply_tax(location_id)
+        booking["apply_tax"] = apply_tax
         # PMS "ngày thanh toán" has start+end; both take booking/period start (not kỳ end).
         payment_day = start_of_day(start)
         customer_id = self.customers[self.customer_key(booking)]
@@ -1050,7 +1061,7 @@ class Importer:
             "monthlyCalculationType": monthly_calc,
             "daysOfMonthCalculationType": "DaysOfCalendar",
             "numberOfPeople": 1,
-            "applyTax": self.location_apply_tax(location_id),
+            "applyTax": apply_tax,
             "currency": "USD" if foreign else "VND",
             "markAsConfirmed": True,
             "paymentSettings": {
@@ -1346,7 +1357,9 @@ class Importer:
             invoice_amount = float(stored_period["totalAmount"])
         else:
             invoice_amount = monthly * period["months"]
-        payment_amount = to_vnd_amount(booking, invoice_amount)
+        payment_amount = payment_transaction_amount(
+            booking, invoice_amount, bool(booking.get("apply_tax")),
+        )
         period_id = stored_period["id"] if stored_period else f"{booking_id}:period:{index}"
         return {
             "period": period,
