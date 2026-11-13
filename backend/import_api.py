@@ -14,13 +14,21 @@ from typing import Callable
 from identity import IdentityError, graphql, namespace_of, refresh_tokens, service_graphql_url
 from onboarding import (
     LABELS,
+    PACKAGE_TYPE_LABEL,
+    PRICE_TYPE_PER_PERSON,
+    PRICE_TYPE_PER_ROOM,
+    PRICE_TYPE_PER_SQUARE_METER,
     build_error_report,
     is_valid_email,
     issue,
     looks_like_company,
     norm_tax,
+    normalize_price_type,
     read_onboarding,
     slug,
+    space_monthly_amount,
+    space_people,
+    space_unit_price,
 )
 
 # Parallel createInvoices for elapsed periods (each call still one issueDate).
@@ -30,9 +38,9 @@ PMS_ERROR = "E16"
 
 VN_TZ = timezone(timedelta(hours=7))
 UTC = timezone.utc
-PRICE_TYPE_PER_ROOM = "PER_ROOM"
 PACKAGE_UNIT_MONTHS = "MONTHS"
 PAYMENT_UNIT_MONTHS = "MONTHS"
+RENTAL_TYPE_AREA = "AREA"
 
 
 class SmartOSError(Exception):
@@ -77,8 +85,11 @@ def pms_issue_placement(message: str, booking: dict | None = None) -> tuple[str,
         return LABELS["room"], text
     if "tỷ giá" in lowered and ("trống" in lowered or "không hợp lệ" in lowered):
         return LABELS["fx"], text
-    if "package" in lowered or "gói" in lowered:
-        return LABELS["room"], text
+    if "package" in lowered or "gói" in lowered or "pricetype" in lowered.replace(" ", ""):
+        return LABELS["package_type"], text
+    compact = lowered.replace(" ", "")
+    if "iszone" in compact or "roomtype" in compact or ("zone" in lowered and "timezone" not in compact):
+        return LABELS["room_type"], text
     if "phương thức thanh toán" in lowered or "paymentmethod" in lowered.replace(" ", ""):
         return LABELS["building"], text
     if "email" in lowered:
@@ -655,51 +666,80 @@ class Importer:
         self.step("floor", f"{building} / {floor_name}", "reused", match["id"])
         return match["id"]
 
+    def space_price_type(self, space: dict) -> str:
+        return normalize_price_type(space.get("price_type") or PRICE_TYPE_PER_ROOM)
+
     def ensure_room(self, building: str, floor_id: str, space: dict):
         service = space["service"]
+        is_zone = bool(space.get("is_zone"))
+        price_type = self.space_price_type(space)
         found = self.client.items(
             self.urls["property"],
             "rooms",
             "RoomQueryInput",
-            "id name { original } packages { id serviceId unit amount priceType }",
+            "id name { original } isZone area capacity packages { id serviceId unit amount priceType }",
             {"floorId": {"eq": floor_id}},
         )
         match = next((item for item in found if item["name"]["original"] == space["room"]), None)
         if match:
-            room = {"id": match["id"], "packages": match.get("packages") or [], "reused": True}
+            existing_zone = bool(match.get("isZone"))
+            if existing_zone != is_zone:
+                wanted = "Zone" if is_zone else "Room"
+                actual = "Zone" if existing_zone else "Room"
+                raise SmartOSError(
+                    f'Phòng "{space["room"]}" trên PMS đang là {actual}, Excel yêu cầu Room Type {wanted}'
+                )
+            room = {
+                "id": match["id"],
+                "packages": match.get("packages") or [],
+                "reused": True,
+                "is_zone": existing_zone,
+                "area": match.get("area", space.get("area")),
+                "capacity": match.get("capacity") or space_people(space),
+            }
             self.rooms[(building, space["room"])] = room
             self.step("room", f"{building} / {space['room']}", "reused", match["id"])
             self.attach_package(room, space)
             return
+        capacity = space_people(space)
+        payload = {
+            "name": i18n(space["room"]),
+            "area": space["area"],
+            "floorId": floor_id,
+            "locationId": self.locations[building],
+            "isZone": is_zone,
+            "packages": [{
+                "priceType": price_type,
+                "unit": PACKAGE_UNIT_MONTHS,
+                "amount": self.package_amount(space),
+                "serviceId": self.services[service],
+            }],
+        }
+        if not is_zone:
+            payload["capacity"] = capacity
+            payload["tier"] = "Standard"
         created = self.client.mutate(
             self.urls["property"],
             "createRoom",
             "CreateRoomCommandInput",
-            "id packages { id serviceId unit amount priceType }",
-            {
-                "name": i18n(space["room"]),
-                "area": space["area"],
-                "floorId": floor_id,
-                "locationId": self.locations[building],
-                "capacity": max(1, round(space["area"] / 10)),
-                "tier": "Standard",
-                "packages": [{
-                    "priceType": PRICE_TYPE_PER_ROOM,
-                    "unit": PACKAGE_UNIT_MONTHS,
-                    "amount": self.package_amount(space),
-                    "serviceId": self.services[service],
-                }],
-            },
+            "id isZone area capacity packages { id serviceId unit amount priceType }",
+            payload,
         )
-        room = {"id": created["id"], "packages": created.get("packages") or []}
+        room = {
+            "id": created["id"],
+            "packages": created.get("packages") or [],
+            "is_zone": bool(created.get("isZone", is_zone)),
+            "area": created.get("area", space.get("area")),
+            "capacity": created.get("capacity") or capacity,
+        }
         self.rooms[(building, space["room"])] = room
         self.step("room", f"{building} / {space['room']}", "created", created["id"])
         self.step("package", f"{space['room']} / {service}", "created")
         self.attach_package(room, space)
 
     def package_amount(self, space: dict) -> float:
-        """Package.amount is the Excel unit price as-is (USD rows stay USD, never × Tỷ giá)."""
-        return float(space["rent"] or 0)
+        """Catalog package.amount = Excel unit rate (per room / person / m2). Never × Tỷ giá."""
+        return space_unit_price(space)
 
     def usd_alternative_amounts(self, space: dict) -> list[dict]:
         if space.get("currency") != "USD":
@@ -708,7 +748,11 @@ class Importer:
 
     def package_input(self, item: dict, space: dict | None = None) -> dict:
         payload = {
-            "priceType": graphql_enum(item.get("priceType") or PRICE_TYPE_PER_ROOM),
+            "priceType": graphql_enum(
+                item.get("priceType")
+                or (space.get("price_type") if space else None)
+                or PRICE_TYPE_PER_ROOM
+            ),
             "unit": graphql_enum(item.get("unit") or PACKAGE_UNIT_MONTHS),
             "amount": item["amount"],
             "serviceId": item["serviceId"],
@@ -722,6 +766,7 @@ class Importer:
     def attach_package(self, room: dict, space: dict):
         service = space["service"]
         service_id = self.services[service]
+        price_type = self.space_price_type(space)
         existing = next(
             (
                 item
@@ -731,12 +776,20 @@ class Importer:
             None,
         )
         if existing:
+            existing_type = graphql_enum(existing.get("priceType") or PRICE_TYPE_PER_ROOM)
+            if existing_type != price_type:
+                wanted = PACKAGE_TYPE_LABEL.get(price_type, price_type)
+                actual = PACKAGE_TYPE_LABEL.get(existing_type, existing_type)
+                raise SmartOSError(
+                    f'Package tháng của phòng "{space["room"]}" / {service} đang {actual}, '
+                    f"Excel yêu cầu Package Type {wanted}"
+                )
             if space.get("currency") == "USD":
                 self.stamp_usd_pricing(room, space)
             return
         kept = [self.package_input(item) for item in room["packages"]]
         kept.append(self.package_input({
-            "priceType": PRICE_TYPE_PER_ROOM,
+            "priceType": price_type,
             "unit": PACKAGE_UNIT_MONTHS,
             "amount": self.package_amount(space),
             "serviceId": service_id,
@@ -875,27 +928,33 @@ class Importer:
             return self.find_customer(email=email)
         return None
 
+    def booking_resource_ids(self, item: dict, is_zone: bool) -> set[str]:
+        if is_zone:
+            return {str(zone_id) for zone_id in item.get("zoneIds") or []}
+        return {str(room_id) for room_id in item.get("roomIds") or []}
+
     def find_bookings(self, booking: dict, ready: list) -> list:
         start, end = booking["start"], booking["end"]
-        room_ids = [room["id"] for _space, room in ready]
+        is_zone = bool(booking.get("is_zone"))
+        resource_ids = [room["id"] for _space, room in ready]
         found = self.client.items(
             self.urls["reservation"],
             "bookings",
             "BookingQueryInput",
-            "id code status startTime endTime roomIds applyTax",
+            "id code status startTime endTime roomIds zoneIds rentalType applyTax",
             {
                 "locationId": {"eq": self.locations[booking["building"]]},
                 "primaryCustomerId": {"eq": self.customers[self.customer_key(booking)]},
             },
         )
-        wanted = set(room_ids)
+        wanted = set(resource_ids)
         matches = []
         for item in found:
             if is_canceled_booking(item.get("status")):
                 continue
             if as_day(item.get("startTime")) != start or as_day(item.get("endTime")) != end:
                 continue
-            if {str(room_id) for room_id in item.get("roomIds") or []} == wanted:
+            if self.booking_resource_ids(item, is_zone) == wanted:
                 matches.append(item)
         return matches
 
@@ -904,12 +963,13 @@ class Importer:
         if not reused:
             return None
         start, end = booking["start"], booking["end"]
+        is_zone = bool(booking.get("is_zone"))
         by_id = {str(room["id"]): space for space, room in reused}
         found = self.client.items(
             self.urls["reservation"],
             "bookings",
             "BookingQueryInput",
-            "id code status startTime endTime roomIds",
+            "id code status startTime endTime roomIds zoneIds rentalType",
             {
                 "locationId": {"eq": self.locations[reused[0][0]["building"]]},
             },
@@ -920,7 +980,7 @@ class Importer:
             item_start, item_end = as_day(item.get("startTime")), as_day(item.get("endTime"))
             if item_start is None or item_end is None or not (item_start < end and item_end > start):
                 continue
-            overlap = {str(room_id) for room_id in item.get("roomIds") or []} & set(by_id)
+            overlap = self.booking_resource_ids(item, is_zone) & set(by_id)
             if not overlap:
                 continue
             space = by_id[next(iter(overlap))]
@@ -1020,23 +1080,36 @@ class Importer:
             self.tax_flags[location_id] = flag
         return flag
 
+    def month_package_for(self, room: dict, space: dict) -> dict:
+        service = space["service"]
+        service_id = self.services[service]
+        package = next(
+            (
+                item for item in room["packages"]
+                if item.get("serviceId") == service_id and is_month_unit(item.get("unit"))
+            ),
+            None,
+        )
+        if package is None:
+            raise SmartOSError(f"Phòng {space['room']} chưa có package tháng cho {service}")
+        return package
+
+    def booking_number_of_people(self, spaces: list[dict]) -> int:
+        person_spaces = [
+            space for space in spaces
+            if normalize_price_type(space.get("price_type")) == PRICE_TYPE_PER_PERSON
+        ]
+        if person_spaces:
+            return max(1, sum(space_people(space) for space in person_spaces))
+        return 1
+
     def create_booking(self, booking: dict, ready: list, name: str) -> str:
         building = booking["building"]
-        rooms: dict[str, dict] = {}
-        for space, room in ready:
-            service = space["service"]
-            service_id = self.services[service]
-            package = next(
-                (
-                    item for item in room["packages"]
-                    if item.get("serviceId") == service_id and is_month_unit(item.get("unit"))
-                ),
-                None,
+        is_zone = bool(booking.get("is_zone"))
+        if any(bool(space.get("is_zone")) != is_zone for space, _room in ready):
+            raise SmartOSError(
+                f'Dòng {booking["rows"][0]}: một booking không thể trộn Room và Zone'
             )
-            if package is None:
-                raise SmartOSError(f"Phòng {space['room']} chưa có package tháng cho {service}")
-            entry = rooms.setdefault(room["id"], {"id": room["id"], "packages": []})
-            entry["packages"].append({"id": package["id"], "amount": float(space["rent"] or 0)})
         deposit = float(booking["deposit"] or 0)
         mode, duration = booking["cycle"]
         start = booking["start"]
@@ -1052,7 +1125,6 @@ class Importer:
         foreign = booking.get("currency") == "USD"
         payload = {
             "locationId": location_id,
-            "rooms": list(rooms.values()),
             "customerIds": [customer_id],
             "primaryCustomerId": customer_id,
             "startTime": start_of_day(start),
@@ -1060,7 +1132,7 @@ class Importer:
             "selectTime": False,
             "monthlyCalculationType": monthly_calc,
             "daysOfMonthCalculationType": "DaysOfCalendar",
-            "numberOfPeople": 1,
+            "numberOfPeople": self.booking_number_of_people([space for space, _room in ready]),
             "applyTax": apply_tax,
             "currency": "USD" if foreign else "VND",
             "markAsConfirmed": True,
@@ -1071,6 +1143,44 @@ class Importer:
                 "firstPeriodPaymentEndDate": payment_day,
             },
         }
+        if is_zone:
+            zones = []
+            rental_area = 0.0
+            for space, room in ready:
+                package = self.month_package_for(room, space)
+                leased = float(space["area"] or 0)
+                if leased <= 0:
+                    raise SmartOSError(
+                        f'Dòng {space["room"]}: Zone cần Diện tích (m2) > 0 để tính Price/m2'
+                    )
+                rental_area += leased
+                zones.append({
+                    "zoneId": room["id"],
+                    "lots": [{
+                        "name": space["room"],
+                        "isDefaultName": True,
+                        "leasedArea": leased,
+                        "packages": [{
+                            "id": package["id"],
+                            "amount": space_unit_price(space),
+                        }],
+                    }],
+                })
+            payload["rentalType"] = RENTAL_TYPE_AREA
+            payload["rentalArea"] = rental_area
+            payload["zones"] = zones
+            payload["rooms"] = []
+        else:
+            rooms: dict[str, dict] = {}
+            for space, room in ready:
+                package = self.month_package_for(room, space)
+                # Unit rate: PER_ROOM line total; PER_PERSON expanded by PMS desks × unit rate.
+                entry = rooms.setdefault(room["id"], {"id": room["id"], "packages": []})
+                entry["packages"].append({
+                    "id": package["id"],
+                    "amount": space_unit_price(space),
+                })
+            payload["rooms"] = list(rooms.values())
         if booking["note"]:
             payload["note"] = booking["note"]
         if foreign:
@@ -1287,7 +1397,7 @@ class Importer:
         if not due:
             return
         existing = self.invoices_by_period(booking_id)
-        monthly = sum(float(space["rent"] or 0) for space in booking["spaces"])
+        monthly = sum(space_monthly_amount(space) for space in booking["spaces"])
         building = booking["building"]
         customer_id = self.customers[self.customer_key(booking)]
         method = self.transfer_method_id(self.locations[building])
@@ -1438,12 +1548,38 @@ class Importer:
         self.step("completeBooking", name, "created", booking_id)
 
 
+def preview_booking_monthly(booking: dict, room_meta: dict[str, dict] | None = None) -> float:
+    """Monthly rent total for preview payment periods from createBooking payload."""
+    meta = room_meta or {}
+    monthly = 0.0
+    for zone in booking.get("zones") or []:
+        for lot in zone.get("lots") or []:
+            leased = float(lot.get("leasedArea") or 0)
+            for package in lot.get("packages") or []:
+                monthly += float(package.get("amount") or 0) * leased
+    if booking.get("zones"):
+        return monthly
+    for room in booking.get("rooms") or []:
+        room_id = str(room.get("id") or "")
+        info = meta.get(room_id) or {}
+        price_type = normalize_price_type(info.get("priceType") or PRICE_TYPE_PER_ROOM)
+        for package in room.get("packages") or []:
+            amount = float(package.get("amount") or 0)
+            if price_type == PRICE_TYPE_PER_PERSON:
+                amount *= float(info.get("capacity") or 1)
+            elif price_type == PRICE_TYPE_PER_SQUARE_METER:
+                amount *= float(info.get("area") or 0)
+            monthly += amount
+    return monthly
+
+
 class PreviewClient:
     """Records mutations locally; does not call PMS."""
 
     def __init__(self):
         self.calls: list[dict] = []
         self._bookings: dict[str, dict] = {}
+        self._room_meta: dict[str, dict] = {}
         self.locations: dict[str, dict] = {}
         self.floors: list[dict] = []
         self.services: dict[str, dict] = {}
@@ -1503,10 +1639,7 @@ class PreviewClient:
         booking = self._bookings.get(booking_id)
         if not booking:
             return []
-        monthly = 0
-        for room in booking.get("rooms") or []:
-            for package in room.get("packages") or []:
-                monthly += package.get("amount") or 0
+        monthly = preview_booking_monthly(booking, self._room_meta)
         start = as_day(booking.get("startTime"))
         end = as_day(booking.get("endTime"))
         duration = int((booking.get("paymentSettings") or {}).get("duration") or 1)
@@ -1541,8 +1674,19 @@ class PreviewClient:
             return {"id": ref, "code": None}
         if field == "createRoom":
             package = payload["packages"][0]
+            area = float(payload.get("area") or 0)
+            capacity = payload.get("capacity") or max(1, round(area / 10))
+            self._room_meta[ref] = {
+                "area": area,
+                "capacity": capacity,
+                "priceType": package.get("priceType"),
+                "isZone": bool(payload.get("isZone")),
+            }
             return {
                 "id": ref,
+                "isZone": bool(payload.get("isZone")),
+                "area": area,
+                "capacity": capacity,
                 "packages": [{
                     "id": f"{ref}:package",
                     "serviceId": package["serviceId"],

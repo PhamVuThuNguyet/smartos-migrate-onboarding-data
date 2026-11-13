@@ -205,11 +205,11 @@ const DATABASE_TABLES: Record<string, string> = {
 };
 
 const SALES_COLUMNS: Record<string, string[]> = {
-  createRoom: ["Phòng", "Tòa", "Tầng", "Diện tích", "Đơn giá", "Cách tính"],
+  createRoom: ["Phòng", "Tòa", "Tầng", "Room Type", "Diện tích", "Đơn giá", "Package Type"],
   createCompany: ["Khách", "Email", "MST", "Người đại diện", "Tòa"],
   createIndividual: ["Khách", "Email", "Tòa"],
   mutatePackages: ["Phòng", "Đơn giá"],
-  createBooking: ["Khách", "Tòa", "Ghi chú", "Bắt đầu", "Kết thúc", "Kỳ", "Cọc", "Số phòng", "Tiền tệ", "Tỷ giá"],
+  createBooking: ["Khách", "Tòa", "Ghi chú", "Bắt đầu", "Kết thúc", "Kỳ", "Cọc", "Số phòng/zone", "Người", "Tiền tệ", "Tỷ giá"],
   createInvoices: ["Booking", "Ngày phát hành", "Hạn thanh toán", "Số dòng"],
   createInvoicePaymentTransaction: ["Khách", "Số tiền", "Ngày", "Phương thức"],
   completeBooking: ["Booking"],
@@ -567,12 +567,17 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
   const place = (value: unknown) => refTitle(calls, value);
   if (call.mutation === "createRoom") {
     const packages = Array.isArray(input.packages) ? input.packages[0] as Record<string, unknown> | undefined : undefined;
-    const rawType = String(packages?.priceType ?? "");
-    const priceType = rawType === "PER_SQUARE_METER" || rawType === "per-square-meter" ? "Theo m2" : "Theo phòng";
+    const rawType = String(packages?.priceType ?? "").toUpperCase().replace(/-/g, "_");
+    const priceType =
+      rawType === "PER_SQUARE_METER" ? "Price/m2"
+        : rawType === "PER_PERSON" ? "Price/person"
+          : "Price/room";
+    const roomType = input.isZone === true ? "Zone" : "Room";
     return [
       originalName(input),
       place(input.locationId),
       place(input.floorId),
+      roomType,
       String(input.area ?? ""),
       displayMoney(packages?.amount),
       priceType,
@@ -593,7 +598,9 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
   if (call.mutation === "createBooking") {
     const settings = input.paymentSettings as { duration?: number } | undefined;
     const deposit = input.deposit as { requiredAmount?: number } | undefined;
+    const zoneCount = Array.isArray(input.zones) ? input.zones.length : 0;
     const roomCount = Array.isArray(input.rooms) ? input.rooms.length : 0;
+    const resourceCount = zoneCount > 0 ? zoneCount : roomCount;
     return [
       place(input.primaryCustomerId),
       place(input.locationId),
@@ -602,7 +609,8 @@ function salesCells(call: ApiCall, calls: ApiCall[]): string[] {
       displayDate(input.endTime),
       settings?.duration ? `${settings.duration} tháng` : "",
       deposit?.requiredAmount ? displayMoney(deposit.requiredAmount) : "0",
-      String(roomCount),
+      String(resourceCount),
+      String(input.numberOfPeople ?? ""),
       String(input.currency ?? ""),
       displayRate(input.exchangeRates),
     ];

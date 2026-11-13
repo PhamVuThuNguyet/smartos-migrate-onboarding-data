@@ -15,6 +15,8 @@ COLUMNS = (
     ("building", "Toà nhà"),
     ("floor", "Tầng"),
     ("room", "Khu vực/phòng"),
+    ("room_type", "Room Type"),
+    ("package_type", "Package Type"),
     ("area", "Diện tích (m2)"),
     ("service", "Dịch vụ cung cấp"),
     ("rent", "Đơn giá cho thuê/tháng"),
@@ -35,13 +37,68 @@ COLUMNS = (
     ("main", "Đặt chỗ chính"),
 )
 LABELS = dict(COLUMNS)
-REQUIRED = ("building", "room", "area", "service", "rent")
+REQUIRED = ("building", "room", "room_type", "package_type", "area", "service", "rent")
 # Rows of one booking must agree on these columns (E12).
 BOOKING_FIELDS = ("email", "fx", "deposit", "contract_no", "template", "note", "main")
 HEADER_SCAN_ROWS = 10
 HEADER_SCAN_COLUMNS = 60
 TRUE_FLAGS = {"co", "x", "true", "yes", "1"}
 FALSE_FLAGS = {"", "khong", "false", "no", "0"}
+
+ROOM_TYPE_ROOM = "Room"
+ROOM_TYPE_ZONE = "Zone"
+PRICE_TYPE_PER_ROOM = "PER_ROOM"
+PRICE_TYPE_PER_PERSON = "PER_PERSON"
+PRICE_TYPE_PER_SQUARE_METER = "PER_SQUARE_METER"
+# Excel display labels → GraphQL enum (via slug keys).
+PACKAGE_TYPE_BY_SLUG = {
+    "price-room": PRICE_TYPE_PER_ROOM,
+    "gia-phong": PRICE_TYPE_PER_ROOM,
+    "price-person": PRICE_TYPE_PER_PERSON,
+    "gia-nguoi": PRICE_TYPE_PER_PERSON,
+    "price-m2": PRICE_TYPE_PER_SQUARE_METER,
+    "price-m-2": PRICE_TYPE_PER_SQUARE_METER,
+    "gia-m2": PRICE_TYPE_PER_SQUARE_METER,
+    "gia-m-2": PRICE_TYPE_PER_SQUARE_METER,
+}
+PACKAGE_TYPE_FOR_ROOM = (PRICE_TYPE_PER_ROOM, PRICE_TYPE_PER_PERSON)
+PACKAGE_TYPE_FOR_ZONE = (PRICE_TYPE_PER_SQUARE_METER,)
+PACKAGE_TYPE_LABEL = {
+    PRICE_TYPE_PER_ROOM: "Price/room",
+    PRICE_TYPE_PER_PERSON: "Price/person",
+    PRICE_TYPE_PER_SQUARE_METER: "Price/m2",
+}
+
+
+def normalize_price_type(value) -> str:
+    return str(value or PRICE_TYPE_PER_ROOM).strip().upper().replace("-", "_")
+
+
+def space_people(space: dict) -> int:
+    """People count for Price/person. Excel has no people column → capacity from area."""
+    capacity = space.get("capacity")
+    if isinstance(capacity, (int, float)) and not isinstance(capacity, bool) and capacity > 0:
+        return max(1, int(round(float(capacity))))
+    area = space.get("area")
+    if isinstance(area, (int, float)) and not isinstance(area, bool) and area >= 0:
+        return max(1, int(round(float(area) / 10)))
+    return 1
+
+
+def space_unit_price(space: dict) -> float:
+    """Catalog / package unit rate from Excel Đơn giá (per room, per person, or per m2)."""
+    return float(space.get("rent") or 0)
+
+
+def space_monthly_amount(space: dict) -> float:
+    """Monthly line total for booking/invoice from Package Type."""
+    unit = space_unit_price(space)
+    price_type = normalize_price_type(space.get("price_type"))
+    if price_type == PRICE_TYPE_PER_SQUARE_METER:
+        return unit * float(space.get("area") or 0)
+    if price_type == PRICE_TYPE_PER_PERSON:
+        return unit * space_people(space)
+    return unit
 
 
 def blank(value) -> bool:
@@ -153,6 +210,25 @@ def parse_monthly_calc(value) -> str | None:
     if key in {"cycle", "chu-ky"}:
         return "Cycle"
     return ""
+
+
+def parse_room_type(value) -> str | None:
+    """Return Room or Zone. None when blank; '' when unknown."""
+    if blank(value):
+        return None
+    key = slug(str(value))
+    if key in {"room", "phong"}:
+        return ROOM_TYPE_ROOM
+    if key in {"zone", "khu-vuc", "area"}:
+        return ROOM_TYPE_ZONE
+    return ""
+
+
+def parse_package_type(value) -> str | None:
+    """Return GraphQL priceType enum. None when blank; '' when unknown."""
+    if blank(value):
+        return None
+    return PACKAGE_TYPE_BY_SLUG.get(slug(str(value)), "")
 
 
 def split_emails(value) -> list[str]:
@@ -282,6 +358,31 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
     if fee is None or fee < 0:
         fail("E14", "fee", f'Dòng {number}: cột "{LABELS["fee"]}" phải là số không âm')
 
+    room_type = parse_room_type(raw["room_type"])
+    if not blank(raw["room_type"]) and room_type == "":
+        fail("E14", "room_type", f'Dòng {number}: cột "Room Type" chỉ nhận Room hoặc Zone')
+    package_type = parse_package_type(raw["package_type"])
+    if not blank(raw["package_type"]) and package_type == "":
+        fail(
+            "E14",
+            "package_type",
+            f'Dòng {number}: cột "Package Type" chỉ nhận Price/room, Price/person hoặc Price/m2',
+        )
+    if room_type == ROOM_TYPE_ROOM and package_type and package_type not in PACKAGE_TYPE_FOR_ROOM:
+        fail(
+            "E14",
+            "package_type",
+            f'Dòng {number}: Room Type là Room thì Package Type chỉ nhận Price/room hoặc Price/person',
+        )
+    if room_type == ROOM_TYPE_ZONE and package_type and package_type not in PACKAGE_TYPE_FOR_ZONE:
+        fail(
+            "E14",
+            "package_type",
+            f'Dòng {number}: Room Type là Zone thì Package Type chỉ nhận Price/m2',
+        )
+    if room_type == ROOM_TYPE_ZONE and area is not None and area <= 0:
+        fail("E05", "area", f"Dòng {number}: Zone (Price/m2) cần Diện tích (m2) lớn hơn 0")
+
     currency = parse_currency(raw["currency"])
     fx = parse_number(raw["fx"])
     if currency is None:
@@ -291,12 +392,18 @@ def read_row(number: int, raw: dict) -> tuple[dict, list[dict]]:
     elif currency == "VND" and not blank(raw["fx"]):
         fail("E08", "fx", f"Dòng {number}: Tỷ giá phải để trống khi tiền tệ là VNĐ")
 
+    capacity = max(1, round(float(area) / 10)) if area is not None else 1
     space = {
         "row": number,
         "building": text(raw["building"]),
         "floor": text(raw["floor"]) or "Không rõ tầng",
         "room": text(raw["room"]),
+        "room_type": room_type,
+        "is_zone": room_type == ROOM_TYPE_ZONE,
+        "package_type": package_type,
+        "price_type": package_type,
         "area": area,
+        "capacity": capacity,
         "service": text(raw["service"]),
         "rent": rent,
         "fee": fee or 0.0,
@@ -402,7 +509,7 @@ def customer_of(space: dict) -> tuple[str, str | None]:
 
 
 def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
-    """One booking per customer, dates, building, cycle, monthly calc, and currency."""
+    """One booking per customer, dates, building, cycle, monthly calc, currency, and Room/Zone."""
     groups: dict[tuple, list[dict]] = {}
     for space in spaces:
         if not space["name"]:
@@ -415,6 +522,7 @@ def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
             space["cycle"],
             space.get("monthly_calc") or "Cycle",
             space["currency"],
+            bool(space.get("is_zone")),
         )
         groups.setdefault(key, []).append(space)
 
@@ -450,6 +558,7 @@ def group_bookings(spaces: list[dict]) -> tuple[list[dict], list[dict]]:
             "template": first["template"],
             "note": first["note"],
             "main": first["main"],
+            "is_zone": bool(first.get("is_zone")),
             "spaces": members,
         })
 
